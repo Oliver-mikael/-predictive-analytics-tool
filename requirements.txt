@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+prophet
+statsmodels
+scikit-learn
+plotly
+holidays
