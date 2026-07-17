@@ -400,7 +400,7 @@ if st.button("🚀 ANALIZAR CON IA", type="primary", use_container_width=True):
         st.write("**Próximos días:**")
         pred_futuras = prediccion[
             prediccion['ds'] > df_limpio['ds'].max()
-        ][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(14)
+        ][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(dias_futuro)
         pred_futuras.columns = ['Fecha', 'Predicción', 'Mínimo', 'Máximo']
         pred_futuras['Fecha'] = pred_futuras['Fecha'].dt.strftime('%d/%m/%Y')
         pred_futuras = pred_futuras.round(2)
