@@ -351,7 +351,14 @@ if st.button("🚀 ANALIZAR CON IA", type="primary", use_container_width=True):
         m2.metric("📉 Error (MAPE)", f"{metricas['MAPE']}%")
         m3.metric("🤖 Modelo", metricas['modelo_ganador'])
         m4.metric("📅 Días analizados", len(df_limpio))
-
+        
+        if metricas['Precision'] < 0:
+            st.error(
+                "⚠️ Tus datos son muy irregulares (picos extremos y días sin ventas). "
+                "Este tipo de modelo funciona mejor con ventas diarias más estables "
+                "(tiendas, restaurantes, retail). Contáctanos para un análisis personalizado."
+            )
+            
         st.write("**Comparación de modelos:**")
         col_p, col_a = st.columns(2)
         col_p.metric(
