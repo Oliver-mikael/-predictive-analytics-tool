@@ -117,18 +117,18 @@ def correr_arima(df_train, df_test):
         resultado = modelo.fit()
         pred = resultado.forecast(steps=len(df_test))
         real_test = df_test['y'].values
+        pred_values = pred.values
 
         mask = real_test > (real_test.mean() * 0.1)
-        # Solo calcula error en días con ventas relevantes
         if mask.sum() > 0:
             mape = np.mean(
-                np.abs((real_test[mask] - pred_test[mask]) / real_test[mask])
+                np.abs((real_test[mask] - pred_values[mask]) / real_test[mask])
             ) * 100
         else:
             mape = np.mean(
-                np.abs((real_test - pred_test) / (real_test + 1))
+                np.abs((real_test - pred_values) / (real_test + 1))
             ) * 100
-        mae = mean_absolute_error(real_test, pred.values)
+        mae = mean_absolute_error(real_test, pred_values)
 
         return {'nombre': 'ARIMA', 'mape': round(mape, 2),
                 'mae': round(mae, 2)}
