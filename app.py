@@ -25,7 +25,7 @@ def limpiar_datos(df, col_fecha, col_ventas):
     df_limpio = df_limpio.dropna()
     df_limpio = df_limpio[df_limpio['y'] >= 0]
     df_limpio = df_limpio.sort_values('ds')
-    df_limpio = df_limpio.drop_duplicates(subset=['ds'])
+    df_limpio = df_limpio.groupby('ds', as_index=False)['y'].sum()
 
     rango = pd.DataFrame({
         'ds': pd.date_range(
