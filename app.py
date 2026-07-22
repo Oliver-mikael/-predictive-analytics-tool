@@ -15,6 +15,10 @@ import plotly.graph_objects as go
 # ============================================
 
 def limpiar_datos(df, col_fecha, col_ventas):
+    """
+    Limpia datos Y retorna información de validación
+    Retorna: (df_limpio, diccionario_validacion)
+    """
     df_limpio = pd.DataFrame()
     df_limpio['ds'] = pd.to_datetime(
         df[col_fecha], dayfirst=True, errors='coerce'
@@ -26,7 +30,7 @@ def limpiar_datos(df, col_fecha, col_ventas):
     df_limpio = df_limpio[df_limpio['y'] >= 0]
     df_limpio = df_limpio.sort_values('ds')
     df_limpio = df_limpio.groupby('ds', as_index=False)['y'].sum()
-
+    
     rango = pd.DataFrame({
         'ds': pd.date_range(
             start=df_limpio['ds'].min(),
@@ -36,15 +40,48 @@ def limpiar_datos(df, col_fecha, col_ventas):
     })
     df_limpio = rango.merge(df_limpio, on='ds', how='left')
     df_limpio['y'] = df_limpio['y'].fillna(0)
-
+    
     Q1 = df_limpio['y'].quantile(0.25)
     Q3 = df_limpio['y'].quantile(0.75)
     IQR = Q3 - Q1
     limite_superior = Q3 + 3 * IQR
     df_limpio['y'] = df_limpio['y'].clip(upper=limite_superior)
-
-    return df_limpio
-
+    
+    # ===== NUEVA SECCIÓN: CALCULAR VALIDACIONES =====
+    # (agregar esto ANTES del return final)
+    
+    dias_disponibles = (df_limpio['ds'].max() - df_limpio['ds'].min()).days
+    cantidad_registros = len(df_limpio)
+    pct_zeros = (df_limpio['y'] == 0).sum() / len(df_limpio) * 100
+    
+    # Determinar estado
+    if dias_disponibles < 30:
+        estado = "ERROR"
+        mensaje = f"❌ Pocos datos: Solo {dias_disponibles} días. Mínimo 30 requerido."
+    elif pct_zeros > 40:
+        estado = "ERROR"
+        mensaje = f"❌ Datos anómalos: {pct_zeros:.1f}% son cero. Verifica el CSV."
+    elif pct_zeros > 20:
+        estado = "WARNING"
+        mensaje = f"⚠️ {pct_zeros:.1f}% de datos son cero. Precisión puede ser menor."
+    elif dias_disponibles < 60:
+        estado = "WARNING"
+        mensaje = f"⚠️ Solo {dias_disponibles} días. Se recomienda 60+ para mejor precisión."
+    else:
+        estado = "OK"
+        mensaje = "✅ Datos válidos para análisis."
+    
+    # Crear diccionario con validación
+    validacion = {
+        'dias': dias_disponibles,
+        'registros': cantidad_registros,
+        'pct_zeros': round(pct_zeros, 2),
+        'estado': estado,  # "OK", "WARNING" o "ERROR"
+        'mensaje': mensaje
+    }
+    
+    # ===== CAMBIO IMPORTANTE: Retornar 2 cosas (NO solo df_limpio) =====
+    return df_limpio, validacion
 
 def obtener_feriados(pais, años):
     paises_map = {
