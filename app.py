@@ -370,15 +370,37 @@ if st.button("🚀 ANALIZAR CON IA", type="primary", use_container_width=True):
     elif not nombre_negocio:
         st.error("❌ Escribe el nombre de tu negocio")
     else:
-        with st.spinner("🔄 Analizando tus datos con IA..."):
-            df_limpio = limpiar_datos(df_raw, col_fecha, col_ventas)
+        # ===== STEP 1: LIMPIAR DATOS =====
+        with st.spinner("🔄 Limpiando datos..."):
+            df_limpio, info_validacion = limpiar_datos(df_raw, col_fecha, col_ventas)
             st.success(f"✅ Datos limpios: {len(df_limpio)} registros")
-
+        
+        # ===== STEP 2: MOSTRAR VALIDACIÓN =====
+        if info_validacion['estado'] == "ERROR":
+            st.error(info_validacion['mensaje'])
+            st.stop()
+        elif info_validacion['estado'] == "WARNING":
+            st.warning(info_validacion['mensaje'])
+        
+        # Mostrar estadísticas
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📅 Días", info_validacion['dias'])
+        with col2:
+            st.metric("📊 Registros", info_validacion['registros'])
+        with col3:
+            st.metric("⚠️ Ceros", f"{info_validacion['pct_zeros']}%")
+        
+        st.divider()
+        
+        # ===== STEP 3: ENTRENAR MODELOS =====
+        with st.spinner("🔄 Entrenando Prophet y ARIMA..."):
             prediccion, metricas = analizar(df_limpio, pais, dias_futuro)
             mejor_dia = obtener_mejor_dia(prediccion)
             recomendaciones = generar_recomendaciones(
                 df_limpio, prediccion, metricas, mejor_dia
             )
+            st.success("✅ Modelos entrenados correctamente")
 
         st.divider()
         st.subheader("📊 Resultados del Análisis")
