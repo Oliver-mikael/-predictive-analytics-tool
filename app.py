@@ -305,7 +305,70 @@ def generar_recomendaciones(df, prediccion, metricas, mejor_dia):
         })
 
     return recomendaciones
-
+def evaluar_confiabilidad(df, mape):
+    """
+    Calcula puntuación 0-100 de confiabilidad del modelo
+    """
+    dias = (df['ds'].max() - df['ds'].min()).days
+    pct_zeros = (df['y'] == 0).sum() / len(df) * 100
+    varianza = df['y'].std() / (df['y'].mean() if df['y'].mean() != 0 else 1)
+    
+    confianza = 0
+    detalles = []
+    
+    # Evaluar CANTIDAD de datos
+    if dias >= 365:
+        confianza += 35
+        detalles.append("✅ Datos de 1+ año")
+    elif dias >= 90:
+        confianza += 25
+        detalles.append("✔️ Datos de 3+ meses")
+    else:
+        confianza += 10
+        detalles.append("⚠️ Menos de 3 meses de datos")
+    
+    # Evaluar CEROS
+    if pct_zeros < 5:
+        confianza += 25
+        detalles.append("✅ Pocas ventas en cero")
+    elif pct_zeros < 20:
+        confianza += 12
+        detalles.append("⚠️ Algunas ventas en cero")
+    else:
+        confianza += 0
+        detalles.append("🔴 Muchas ventas en cero")
+    
+    # Evaluar VARIABILIDAD
+    if 0.3 < varianza < 2:
+        confianza += 20
+        detalles.append("✅ Variabilidad normal")
+    elif varianza == 0:
+        confianza += 0
+        detalles.append("🔴 Ventas casi iguales")
+    else:
+        confianza += 10
+        detalles.append("⚠️ Variabilidad muy alta")
+    
+    # Evaluar MAPE (precisión)
+    if mape < 10:
+        confianza += 20
+        detalles.append("✅ Modelo muy preciso")
+    elif mape < 20:
+        confianza += 15
+        detalles.append("✅ Modelo preciso")
+    else:
+        confianza += 10
+        detalles.append("⚠️ Modelo moderado")
+    
+    # Determinar nivel
+    if confianza >= 85:
+        nivel = "🟢 ALTA"
+    elif confianza >= 60:
+        nivel = "🟡 MEDIA"
+    else:
+        nivel = "🔴 BAJA"
+    
+    return {"score": confianza, "nivel": nivel, "detalles": detalles}
 
 # ============================================
 # INTERFAZ STREAMLIT
@@ -404,7 +467,20 @@ if st.button("🚀 ANALIZAR CON IA", type="primary", use_container_width=True):
 
         st.divider()
         st.subheader("📊 Resultados del Análisis")
-
+        # ===== INDICADOR DE CONFIABILIDAD =====
+        confianza = evaluar_confiabilidad(df_limpio, metricas['MAPE'])
+        
+        with st.container(border=True):
+            col_conf, col_score = st.columns([2, 1])
+            with col_conf:
+                st.markdown(f"### Confiabilidad: {confianza['nivel']}")
+            with col_score:
+                st.markdown(f"### {confianza['score']}/100")
+            
+            for detalle in confianza['detalles']:
+                st.write(detalle)
+        
+        st.divider()
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("🎯 Precisión", f"{metricas['Precision']}%")
         m2.metric("📉 Error (MAPE)", f"{metricas['MAPE']}%")
