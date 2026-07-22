@@ -377,53 +377,84 @@ def evaluar_confiabilidad(df, mape):
 st.set_page_config(page_title="Predictive Analytics Tool", layout="wide")
 
 st.title("📊 Predictive Analytics Tool")
+
 st.write("Herramienta de predicción con IA")
 st.divider()
 
-col1, col2 = st.columns(2)
-
-with col1:
+# ===== SIDEBAR CON CONFIGURACIÓN =====
+with st.sidebar:
+    st.title("⚙️ Configuración")
+    st.divider()
+    
+    # SECCIÓN 1: NOMBRE DEL NEGOCIO
+    st.subheader("🏪 Tu Negocio")
     nombre_negocio = st.text_input(
-        "🏪 Nombre de tu negocio:",
-        placeholder="Ej: Tienda El Alto"
+        "Nombre:",
+        placeholder="Ej: Starbucks",
+        label_visibility="collapsed"
     )
-
-with col2:
+    
+    # SECCIÓN 2: PAÍS
+    st.subheader("🌍 País")
     pais = st.selectbox(
-        "🌎 Selecciona tu país:",
+        "Selecciona país:",
         ["Bolivia", "México", "Argentina", "Colombia", "Perú",
          "Chile", "España", "USA", "Brasil", "Ecuador",
-         "Venezuela", "Paraguay"]
+         "Venezuela", "Paraguay"],
+        label_visibility="collapsed"
     )
+    
+    # SECCIÓN 3: DÍAS A PREDECIR
+    st.subheader("📅 Predicción")
+    dias_futuro = st.slider(
+        "¿Cuántos días?",
+        min_value=7, max_value=90, value=30, step=7,
+        label_visibility="collapsed"
+    )
+    
+    st.divider()
+    
+    # SECCIÓN 4: CARGAR CSV
+    st.subheader("📁 Datos")
+    archivo = st.file_uploader(
+        "Sube tu CSV:",
+        type=['csv'],
+        help="Columnas: fecha y ventas",
+        label_visibility="collapsed"
+    )
+    
+    st.divider()
+    
+    st.info("""
+    📌 **Requisitos:**
+    - Mínimo 30 días
+    - Formato: DD/MM/YYYY
+    """)
 
-dias_futuro = st.slider(
-    "📅 ¿Cuántos días quieres predecir?",
-    min_value=7, max_value=90, value=30, step=7
-)
-
+# ===== CUERPO PRINCIPAL (LIMPIO) =====
+st.title("📊 Predictor de Ventas")
+st.write("Análisis predictivo con IA")
 st.divider()
 
-archivo = st.file_uploader(
-    "📁 Sube tu archivo CSV de ventas:",
-    type=['csv'],
-    help="Debe tener columnas de fecha y ventas"
-)
-
 df_raw = None
+col_fecha = None
+col_ventas = None
+
 if archivo is not None:
     df_raw = pd.read_csv(archivo, encoding='latin1')
     st.success(f"✅ Archivo cargado: {len(df_raw)} filas")
-    st.write("**Vista previa:**")
-    st.dataframe(df_raw.head(3))
-
+    
+    with st.expander("👁️ Ver vista previa del CSV"):
+        st.dataframe(df_raw.head(5))
+    
     st.write("**Selecciona las columnas correctas:**")
     col_a, col_b = st.columns(2)
     with col_a:
-        col_fecha = st.selectbox("📅 Columna de FECHA:", df_raw.columns.tolist())
+        col_fecha = st.selectbox("📅 Fecha:", df_raw.columns.tolist(), key="fecha_select")
     with col_b:
-        col_ventas = st.selectbox("💰 Columna de VENTAS:", df_raw.columns.tolist())
+        col_ventas = st.selectbox("💰 Ventas:", df_raw.columns.tolist(), key="ventas_select")
 else:
-    st.info("👆 Sube tu CSV para continuar")
+    st.info("👈 **Usa el panel izquierdo para cargar tu CSV**")
 
 st.divider()
 
@@ -486,7 +517,26 @@ if st.button("🚀 ANALIZAR CON IA", type="primary", use_container_width=True):
         m2.metric("📉 Error (MAPE)", f"{metricas['MAPE']}%")
         m3.metric("🤖 Modelo", metricas['modelo_ganador'])
         m4.metric("📅 Días analizados", len(df_limpio))
+        # ===== EXPLICACIÓN DE MAPE =====
+        with st.expander("ℹ️ ¿Qué significa MAPE y Precisión?"):
+            st.write(f"""
+            **MAPE = {metricas['MAPE']}%** (Error Porcentual Medio Absoluto)
+            
+            Significa que en promedio, el modelo se equivoca **{metricas['MAPE']:.1f}%** 
+            en sus predicciones de ventas.
+            
+            ---
+            
+            **Interpretación:**
+            - **5-10%** → ✅ Excelente (muy confiable)
+            - **10-20%** → ✅ Bueno (confiable)
+            - **20-30%** → ⚠️ Aceptable (úsalo como guía)
+            - **>30%** → 🔴 Bajo (tus datos son irregulares)
+            
+            **Tu modelo:** {metricas['Precision']}% de precisión
+            """)
         
+        st.divider()
         if metricas['Precision'] < 0:
             st.error(
                 "⚠️ Tus datos son muy irregulares (picos extremos y días sin ventas). "
