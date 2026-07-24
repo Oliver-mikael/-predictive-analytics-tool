@@ -643,11 +643,11 @@ def evaluar_confiabilidad(df, mape):
     return {"score": confianza, "nivel": nivel, "detalles": detalles}
 
 # ============================================
-# INTERFAZ STREAMLIT - SALESPREDICT V2
+# INTERFAZ STREAMLIT - Predicción de Ventas versión_2
 # ============================================
 
 st.set_page_config(
-    page_title="SalesPredict v2 - Prediccion Inteligente",
+    page_title="Predicción de Ventas versión_2 - Prediccion Inteligente",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
