@@ -766,7 +766,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # HEADER
-st.markdown('<div class="main-header">📊 SalesPredict v2</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">📊 Predicción de Ventas versión_2</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Prediccion inteligente de ventas para tu negocio</div>', unsafe_allow_html=True)
 
 # Sidebar
