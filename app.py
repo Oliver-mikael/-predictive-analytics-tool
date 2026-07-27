@@ -3,14 +3,11 @@ import pandas as pd
 import numpy as np
 import warnings
 import holidays
-from datetime import datetime, timedelta
 warnings.filterwarnings('ignore')
 
 from prophet import Prophet
-from statsmodels.tsa.arima.model import ARIMA
-from sklearn.metrics import mean_absolute_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 import plotly.graph_objects as go
-import plotly.express as px
 
 # ============================================
 # DETECCION DE LIBRERIAS OPCIONALES
@@ -35,8 +32,8 @@ except ImportError:
 # CONSTANTES Y CONFIGURACION
 # ============================================
 
-MAX_FILAS_CACHE = 500_000  # Limite para datasets grandes
-CHUNK_SIZE = 50_000       # Procesar en chunks si excede
+MAX_FILAS_CACHE = 2_000_000  # Aviso para datasets muy grandes
+CHUNK_SIZE = 200_000         # Lectura por bloques
 
 # ============================================
 # FUNCIONES DE UTILIDAD (CACHE + PERFORMANCE)
@@ -45,30 +42,19 @@ CHUNK_SIZE = 50_000       # Procesar en chunks si excede
 @st.cache_data(ttl=3600, show_spinner=False)
 def cargar_csv_seguro(archivo_bytes, encoding='latin1'):
     """
-    Carga CSV de forma segura y eficiente.
-    Para archivos grandes, usa sampling estratificado.
+    Carga el CSV completo (por bloques si es grande).
+
+    Antes se muestreaba con skiprows cuando el archivo era grande: eso rompe
+    la suma diaria de ventas (se pierden transacciones de cada dia) y por si
+    solo inflaba el error. Mejor leer todo y solo avisar si es enorme.
     """
     try:
-        # Primero leer solo headers para detectar columnas
-        headers = pd.read_csv(archivo_bytes, nrows=0, encoding=encoding).columns.tolist()
         archivo_bytes.seek(0)
-
-        # Contar filas aproximadas
-        total_filas = sum(1 for _ in archivo_bytes) - 1
-        archivo_bytes.seek(0)
-
+        bloques = pd.read_csv(archivo_bytes, encoding=encoding, chunksize=CHUNK_SIZE)
+        df = pd.concat(bloques, ignore_index=True)
+        total_filas = len(df)
         if total_filas > MAX_FILAS_CACHE:
-            st.warning(f"Archivo muy grande ({total_filas:,} filas). Se procesara una muestra representativa.")
-            # Cargar con skiprows para muestreo (mantener distribucion temporal)
-            skip = max(1, int(total_filas / MAX_FILAS_CACHE))
-            df = pd.read_csv(
-                archivo_bytes,
-                encoding=encoding,
-                skiprows=lambda x: x > 0 and x % skip != 0
-            )
-        else:
-            df = pd.read_csv(archivo_bytes, encoding=encoding)
-
+            st.warning(f"Archivo muy grande ({total_filas:,} filas). El analisis puede tardar.")
         return df, total_filas
     except Exception as e:
         return None, str(e)
@@ -139,124 +125,219 @@ def detectar_columnas_clave(df):
     }
 
 # ============================================
-# LIMPIEZA Y FEATURE ENGINEERING MEJORADO
+# PARSEO DE FECHAS ROBUSTO
+# ============================================
+
+def parsear_fechas(serie):
+    """
+    Parsea fechas probando formatos dia-primero y mes-primero y quedandose
+    con el que menos valores pierde. Devuelve (fechas, info).
+
+    Un dayfirst=True fijo destroza CSVs en formato US (MM/DD/YYYY): las filas
+    con dia > 12 quedan en NaT y el resto se transpone (12/03 -> 3 de dic).
+    """
+    texto = serie.astype(str).str.strip()
+    candidatos = []
+
+    for etiqueta, kwargs in [
+        ("DD/MM/YYYY", {'dayfirst': True}),
+        ("MM/DD/YYYY", {'dayfirst': False}),
+    ]:
+        parsed = pd.to_datetime(texto, errors='coerce', **kwargs)
+        nulos = int(parsed.isna().sum())
+        # Penalizacion extra: un formato correcto suele dar dias consecutivos
+        dias_unicos = parsed.dropna().dt.normalize().nunique()
+        rango = 1
+        if dias_unicos > 1:
+            rango = max(1, (parsed.max() - parsed.min()).days + 1)
+        densidad = dias_unicos / rango
+        candidatos.append((nulos, -densidad, etiqueta, parsed))
+
+    candidatos.sort(key=lambda x: (x[0], x[1]))
+    nulos, _, etiqueta, fechas = candidatos[0]
+
+    info = {
+        'formato': etiqueta,
+        'no_parseadas': nulos,
+        'pct_no_parseadas': round(nulos / max(len(texto), 1) * 100, 2)
+    }
+    return fechas, info
+
+
+# ============================================
+# LIMPIEZA Y FEATURE ENGINEERING
 # ============================================
 
 def limpiar_datos_v3(df, col_fecha, col_ventas):
     """
-    Limpia datos de forma robusta. Maneja grandes volumenes.
-    Retorna: (df_limpio, info_validacion, df_original_con_features)
+    Limpia y agrega a serie diaria.
+    Cambios clave vs version anterior:
+      - parseo de fecha auto (dia-primero vs mes-primero)
+      - los dias sin datos NO se rellenan con 0 a ciegas: se detecta el patron
+        de dias cerrados (ej. domingos) y el resto se marca como hueco real
+      - los outliers NO se recortan aqui (se recortan dentro de cada fold con
+        umbrales calculados solo con train, para no filtrar futuro)
+    Retorna: (df_diario, info)
     """
     df_proc = pd.DataFrame()
-    df_proc['ds'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
+    fechas, info_fecha = parsear_fechas(df[col_fecha])
+    df_proc['ds'] = fechas.dt.normalize()
     df_proc['y'] = pd.to_numeric(df[col_ventas], errors='coerce')
 
-    # Eliminar nulos y negativos
     df_proc = df_proc.dropna()
     df_proc = df_proc[df_proc['y'] >= 0]
     df_proc = df_proc.sort_values('ds')
 
-    # AGREGAR por fecha (suma diaria)
+    if df_proc.empty:
+        info = {'dias': 0, 'registros': 0, 'pct_zeros': 100, 'estado': 'ERROR',
+                'mensaje': 'No se pudo interpretar ninguna fecha/monto valido.',
+                'formato_fecha': info_fecha['formato'],
+                'pct_no_parseadas': info_fecha['pct_no_parseadas']}
+        return df_proc.assign(ds=pd.to_datetime([]), y=[]), info
+
+    # Suma diaria
     df_diario = df_proc.groupby('ds', as_index=False)['y'].sum()
 
-    # Rellenar dias faltantes
+    # Grilla diaria completa: los dias ausentes quedan como NaN (no como 0)
     rango = pd.DataFrame({
         'ds': pd.date_range(start=df_diario['ds'].min(),
                             end=df_diario['ds'].max(), freq='D')
     })
     df_diario = rango.merge(df_diario, on='ds', how='left')
-    df_diario['y'] = df_diario['y'].fillna(0)
 
-    # Outliers: clip al percentil 99.5 (mas permisivo que IQR*3)
-    p99 = df_diario['y'].quantile(0.995)
-    df_diario['y'] = df_diario['y'].clip(upper=p99)
+    # Dias cerrados estructurales: un dia de semana ausente casi siempre
+    ausente = df_diario['y'].isna()
+    dow = df_diario['ds'].dt.dayofweek
+    dias_cerrados = []
+    for d in range(7):
+        mask = dow == d
+        if mask.sum() >= 4 and ausente[mask].mean() >= 0.8:
+            dias_cerrados.append(d)
 
-    # Validaciones
-    dias = (df_diario['ds'].max() - df_diario['ds'].min()).days
-    registros = len(df_diario)
-    pct_zeros = (df_diario['y'] == 0).sum() / len(df_diario) * 100
+    # Un dia cerrado no es un error de datos: es una venta 0 predecible.
+    # Se marca para excluirlo de las metricas y se deja fuera del entrenamiento.
+    df_diario['cerrado'] = dow.isin(dias_cerrados).astype(int)
 
-    if dias < 30:
-        estado, mensaje = "ERROR", f"Solo {dias} dias. Minimo 30."
-    elif pct_zeros > 50:
-        estado, mensaje = "ERROR", f"{pct_zeros:.1f}% ceros. Datos muy fragmentados."
-    elif pct_zeros > 25:
-        estado, mensaje = "WARNING", f"{pct_zeros:.1f}% ceros. Precision afectada."
-    elif dias < 90:
-        estado, mensaje = "WARNING", f"Solo {dias} dias. Recomendado 90+ para precision."
+    # Huecos aislados (no estructurales): interpolar en vez de meter 0,
+    # que es lo que mas inflaba el MAPE en CSVs con dias faltantes.
+    huecos = int((ausente & (df_diario['cerrado'] == 0)).sum())
+    df_diario['y'] = df_diario['y'].interpolate(limit_direction='both')
+    df_diario.loc[df_diario['cerrado'] == 1, 'y'] = 0.0
+
+    dias = (df_diario['ds'].max() - df_diario['ds'].min()).days + 1
+    dias_abiertos = int((df_diario['cerrado'] == 0).sum())
+    abiertos = df_diario[df_diario['cerrado'] == 0]
+    pct_zeros = (abiertos['y'] == 0).sum() / max(len(abiertos), 1) * 100
+    cv = abiertos['y'].std() / abiertos['y'].mean() if abiertos['y'].mean() else 0
+
+    if dias_abiertos < 30:
+        estado, mensaje = "ERROR", f"Solo {dias_abiertos} dias con datos. Minimo 30."
+    elif info_fecha['pct_no_parseadas'] > 20:
+        estado, mensaje = "ERROR", (f"{info_fecha['pct_no_parseadas']}% de fechas ilegibles "
+                                    f"(formato detectado: {info_fecha['formato']}). Revisa el CSV.")
+    elif pct_zeros > 40:
+        estado, mensaje = "ERROR", f"{pct_zeros:.1f}% de dias abiertos en 0. Datos muy fragmentados."
+    elif pct_zeros > 20:
+        estado, mensaje = "WARNING", f"{pct_zeros:.1f}% de dias en 0. Precision afectada."
+    elif huecos > dias * 0.1:
+        estado, mensaje = "WARNING", f"{huecos} dias sin registros se interpolaron."
+    elif dias_abiertos < 90:
+        estado, mensaje = "WARNING", f"Solo {dias_abiertos} dias. Recomendado 90+ para precision."
     else:
         estado, mensaje = "OK", "Datos validos."
 
     info = {
-        'dias': dias,
-        'registros': registros,
+        'dias': dias_abiertos,
+        'dias_calendario': dias,
+        'registros': len(df_diario),
         'pct_zeros': round(pct_zeros, 2),
+        'huecos_interpolados': huecos,
+        'dias_cerrados': dias_cerrados,
+        'cv': round(float(cv), 3),
         'estado': estado,
         'mensaje': mensaje,
+        'formato_fecha': info_fecha['formato'],
+        'pct_no_parseadas': info_fecha['pct_no_parseadas'],
         'fecha_min': df_diario['ds'].min(),
         'fecha_max': df_diario['ds'].max(),
-        'venta_promedio': df_diario['y'].mean(),
-        'venta_std': df_diario['y'].std()
+        'venta_promedio': abiertos['y'].mean(),
+        'venta_std': abiertos['y'].std()
     }
 
-    return df_diario, info
+    return df_diario[['ds', 'y', 'cerrado']], info
 
 
-def crear_features_v3(df, usar_log=False):
+def sugerir_log(df):
+    """Log conviene con varianza alta y asimetria positiva, y sin ceros dominantes."""
+    y = df.loc[df.get('cerrado', 0) == 0, 'y'] if 'cerrado' in df else df['y']
+    y = y[y > 0]
+    if len(y) < 30:
+        return False
+    cv = y.std() / y.mean()
+    asimetria = float(((y - y.mean()) ** 3).mean() / (y.std() ** 3 + 1e-9))
+    return bool(cv > 0.45 and asimetria > 0.6)
+
+
+def features_calendario(fechas):
+    """Features conocidas de antemano (no dependen de ventas => nunca hay leakage)."""
+    f = pd.DataFrame({'ds': pd.to_datetime(fechas)})
+    f['dia_semana'] = f['ds'].dt.dayofweek
+    f['es_finde'] = (f['dia_semana'] >= 5).astype(int)
+    f['dia_mes'] = f['ds'].dt.day
+    f['mes'] = f['ds'].dt.month
+    f['dias_en_mes'] = f['ds'].dt.days_in_month
+    f['semana_ano'] = f['ds'].dt.isocalendar().week.astype(int)
+    f['es_quincena'] = f['dia_mes'].between(14, 17).astype(int)
+    # Fin de mes relativo (no fijo en 28-31: en febrero el 28 ya es fin de mes)
+    f['es_fin_mes'] = (f['dias_en_mes'] - f['dia_mes'] <= 2).astype(int)
+    f['es_inicio_mes'] = (f['dia_mes'] <= 3).astype(int)
+    f['dia_semana_sin'] = np.sin(2 * np.pi * f['dia_semana'] / 7)
+    f['dia_semana_cos'] = np.cos(2 * np.pi * f['dia_semana'] / 7)
+    f['mes_sin'] = np.sin(2 * np.pi * f['mes'] / 12)
+    f['mes_cos'] = np.cos(2 * np.pi * f['mes'] / 12)
+    return f.drop(columns=['dias_en_mes'])
+
+
+REGRESSORS_PROPHET = ['es_finde', 'es_quincena', 'es_fin_mes']
+LAGS = [1, 2, 3, 7, 14, 21, 28]
+
+
+def crear_features_v3(df, feriados_set=None):
     """
-    Feature engineering optimizado para supermercados.
-    Incluye quincena, fin de mes, y patrones de pago (critico en LATAM).
+    Features para XGBoost. Todos los lags/medias usan shift(>=1), asi que la
+    fila del dia a predecir se puede construir con y=NaN sin mirar el futuro.
+    IMPORTANTE: no se hace dropna aqui (antes se borraba justamente la fila
+    que se queria predecir y se predecia el dia equivocado).
     """
-    df = df.copy()
-    df = df.sort_values('ds').reset_index(drop=True)
+    df = df.sort_values('ds').reset_index(drop=True).copy()
+    cal = features_calendario(df['ds'])
+    df = pd.concat([df, cal.drop(columns=['ds'])], axis=1)
 
-    # Transformacion logaritmica opcional (para alta varianza)
-    if usar_log:
-        df['y_raw'] = df['y'].copy()
-        df['y'] = np.log1p(df['y'])
+    if feriados_set is not None:
+        fechas_norm = df['ds'].dt.normalize()
+        df['es_feriado'] = fechas_norm.isin(feriados_set).astype(int)
+        df['feriado_manana'] = (fechas_norm + pd.Timedelta(days=1)).isin(feriados_set).astype(int)
+        df['feriado_ayer'] = (fechas_norm - pd.Timedelta(days=1)).isin(feriados_set).astype(int)
 
-    # === CALENDARIO ===
-    df['dia_semana'] = df['ds'].dt.dayofweek          # 0=Lunes
-    df['es_finde'] = (df['ds'].dt.dayofweek >= 5).astype(int)
-    df['dia_mes'] = df['ds'].dt.day
-    df['mes'] = df['ds'].dt.month
-    df['trimestre'] = df['ds'].dt.quarter
-    df['semana_ano'] = df['ds'].dt.isocalendar().week.astype(int)
-
-    # === QUINCENA / DIA DE PAGO (critico en LATAM) ===
-    # Quincena: dias 14-16 y 29-31 (ajustado por mes)
-    df['es_quincena'] = ((df['dia_mes'] >= 14) & (df['dia_mes'] <= 16)).astype(int)
-    df['es_fin_mes'] = df['dia_mes'].isin([28, 29, 30, 31]).astype(int)
-    df['es_inicio_mes'] = (df['dia_mes'] <= 3).astype(int)
-
-    # === LAGS (patrones ciclicos) ===
-    for lag in [1, 7, 14, 21, 28]:
+    y_prev = df['y'].shift(1)
+    for lag in LAGS:
         df[f'lag_{lag}'] = df['y'].shift(lag)
 
-    # === MEDIAS MOVILES ===
-    df['ma_7'] = df['y'].shift(1).rolling(7, min_periods=1).mean()
-    df['ma_14'] = df['y'].shift(1).rolling(14, min_periods=1).mean()
-    df['ma_30'] = df['y'].shift(1).rolling(30, min_periods=1).mean()
-
-    # === TENDENCIA ===
-    df['diff_7'] = df['y'].shift(1).diff(7)
-    df['diff_14'] = df['y'].shift(1).diff(14)
-
-    # === RATIOS ===
-    df['ratio_ma7'] = df['y'].shift(1) / (df['ma_7'] + 1)
-    df['ratio_ma30'] = df['y'].shift(1) / (df['ma_30'] + 1)
-
-    # === FEATURES CICLICAS (seno/coseno para dia semana y mes) ===
-    # Esto ayuda a que el modelo entienda que Domingo(6) esta cerca de Lunes(0)
-    df['dia_semana_sin'] = np.sin(2 * np.pi * df['dia_semana'] / 7)
-    df['dia_semana_cos'] = np.cos(2 * np.pi * df['dia_semana'] / 7)
-    df['mes_sin'] = np.sin(2 * np.pi * df['mes'] / 12)
-    df['mes_cos'] = np.cos(2 * np.pi * df['mes'] / 12)
-
-    # Eliminar NaN (primeras 28 filas no tienen lag_28)
-    df = df.dropna().reset_index(drop=True)
-
+    df['ma_7'] = y_prev.rolling(7, min_periods=7).mean()
+    df['ma_14'] = y_prev.rolling(14, min_periods=14).mean()
+    df['ma_28'] = y_prev.rolling(28, min_periods=28).mean()
+    df['std_7'] = y_prev.rolling(7, min_periods=7).std()
+    # Nivel del mismo dia de semana en las ultimas 4 semanas (patron semanal)
+    df['ma_dow_4'] = df[['lag_7', 'lag_14', 'lag_21', 'lag_28']].mean(axis=1)
+    df['diff_7'] = df['lag_1'] - df['lag_8'] if 'lag_8' in df else df['lag_1'] - df['y'].shift(8)
+    df['tendencia_7_28'] = df['ma_7'] / (df['ma_28'] + 1e-6)
+    df['ratio_lag1_ma7'] = df['lag_1'] / (df['ma_7'] + 1e-6)
+    df['ratio_dow'] = df['lag_7'] / (df['ma_7'] + 1e-6)
     return df
+
+
+def columnas_features(df):
+    return [c for c in df.columns if c not in ('ds', 'y', 'cerrado')]
 
 
 def obtener_feriados(pais, anos):
@@ -279,500 +360,491 @@ def obtener_feriados(pais, anos):
         if clase:
             lista = []
             for a in anos:
-                f = clase(years=a)
-                for fecha, nombre in f.items():
+                for fecha, nombre in clase(years=a).items():
                     lista.append({'holiday': nombre, 'ds': pd.Timestamp(fecha)})
-            return pd.DataFrame(lista)
-    except:
+            if lista:
+                return pd.DataFrame(lista).drop_duplicates('ds')
+    except Exception:
         pass
     return None
 
+
 # ============================================
-# MODELOS DE PREDICCION MEJORADOS
+# METRICAS
 # ============================================
+
+def calcular_metricas(real, pred, mask_valida=None):
+    """
+    MAPE real (no inventado) + WAPE + sMAPE + MAE.
+      - MAPE: solo sobre dias con venta > 0 (es indefinido en 0).
+      - WAPE: sum|error| / sum(real). Es la metrica de seleccion: no explota
+        con dias de venta minima y no premia predecir por debajo.
+    """
+    real = np.asarray(real, dtype=float)
+    pred = np.clip(np.asarray(pred, dtype=float), 0, None)
+    if mask_valida is not None:
+        mask_valida = np.asarray(mask_valida, dtype=bool)
+        real, pred = real[mask_valida], pred[mask_valida]
+
+    if len(real) == 0:
+        return {'mape': 999.0, 'wape': 999.0, 'smape': 999.0, 'mae': 999.0, 'n': 0}
+
+    err = np.abs(real - pred)
+    pos = real > 0
+    mape = float(np.mean(err[pos] / real[pos]) * 100) if pos.any() else 999.0
+    wape = float(err.sum() / real.sum() * 100) if real.sum() > 0 else 999.0
+    denom = (np.abs(real) + np.abs(pred)) / 2
+    ok = denom > 1e-9
+    smape = float(np.mean(err[ok] / denom[ok]) * 100) if ok.any() else 999.0
+    if not pos.any():
+        mape = wape
+    return {'mape': round(mape, 2), 'wape': round(wape, 2),
+            'smape': round(smape, 2), 'mae': round(float(err.mean()), 2), 'n': int(len(real))}
+
 
 def calcular_mape(real, pred):
-    """MAPE simetrico (sMAPE) + MAPE filtrado. Mas estable con ceros y picos."""
-    real = np.asarray(real, dtype=float)
-    pred = np.asarray(pred, dtype=float)
-    pred = np.clip(pred, 0, None)
+    """Compatibilidad: MAPE real sobre dias con venta > 0."""
+    return calcular_metricas(real, pred)['mape']
 
-    # sMAPE: penaliza menos dias con venta muy baja
-    denom = (np.abs(real) + np.abs(pred)) / 2
-    mask_s = denom > 1e-6
-    smape = np.mean(np.abs(real[mask_s] - pred[mask_s]) / denom[mask_s]) * 100 if mask_s.any() else 999
-
-    # MAPE clasico solo en dias con venta significativa (>5% de la mediana)
-    umbral = max(np.median(real[real > 0]) * 0.05, 1.0) if (real > 0).any() else 1.0
-    mask = real >= umbral
-    if mask.sum() >= max(7, len(real) // 4):
-        mape = np.mean(np.abs((real[mask] - pred[mask]) / real[mask])) * 100
-    else:
-        mape = smape
-
-    # Metrica final: promedio conservador (peor caso entre ambos)
-    return float(np.mean([mape, smape]))
-
-
-def correr_prophet_mejorado(df_train, df_test, feriados=None, usar_regressors=True, usar_log=False):
-    """
-    Prophet mejorado con:
-    - changepoint_prior_scale alto (datos irregulares)
-    - seasonality_mode multiplicativo
-    - Regressors: fin de semana, quincena, fin de mes
-    """
-    try:
-        modelo = Prophet(
-            weekly_seasonality=len(df_train) > 30,
-            yearly_seasonality=len(df_train) > 365,
-            daily_seasonality=False,
-            interval_width=0.95,
-            holidays=feriados,
-            changepoint_prior_scale=0.15,      # Menos overfitting en series ruidosas
-            seasonality_mode='multiplicative', # Mejor para datos con crecimiento
-            changepoint_range=0.95             # Detectar cambios hasta el 95% de datos
-        )
-
-        # Agregar regressors si hay suficientes datos
-        if usar_regressors and len(df_train) > 60:
-            # Crear features en train para usar como regressors
-            df_train_f = crear_features_v3(df_train.copy(), usar_log=False)
-
-            # Solo usar features que existen en train y se pueden proyectar a test
-            regressors = ['es_finde', 'es_quincena', 'es_fin_mes']
-            for r in regressors:
-                if r in df_train_f.columns:
-                    modelo.add_regressor(r)
-
-            # Merge regressors al train original
-            df_train_reg = df_train.merge(
-                df_train_f[['ds'] + regressors], on='ds', how='left'
-            )
-            df_train_reg[regressors] = df_train_reg[regressors].fillna(0)
-        else:
-            df_train_reg = df_train.copy()
-            regressors = []
-
-        modelo.fit(df_train_reg)
-
-        # Preparar futuro con regressors para test
-        futuro = modelo.make_future_dataframe(periods=len(df_test), freq='D')
-
-        if regressors:
-            df_test_f = crear_features_v3(
-                pd.concat([df_train, df_test]).reset_index(drop=True),
-                usar_log=False
-            )
-            df_test_f = df_test_f[['ds'] + regressors]
-            futuro = futuro.merge(df_test_f, on='ds', how='left')
-            futuro[regressors] = futuro[regressors].fillna(0)
-
-        pred = modelo.predict(futuro)
-        pred_test = pred['yhat'].tail(len(df_test)).values
-        real_test = df_test['y'].values.copy()
-        if usar_log:
-            pred_test = np.expm1(pred_test)
-            real_test = np.expm1(real_test)
-        pred_test = np.clip(pred_test, 0, None)
-
-        mape = calcular_mape(real_test, pred_test)
-        mae = mean_absolute_error(real_test, pred_test)
-
-        return {
-            'nombre': 'Prophet+', 'mape': round(mape, 2),
-            'mae': round(mae, 2), 'modelo': modelo,
-            'pred_test': pred_test, 'usar_log': usar_log,
-            'feriados': feriados, 'usar_regressors': usar_regressors
-        }
-    except Exception as e:
-        return {'nombre': 'Prophet+', 'mape': 999, 'mae': 999, 'error': str(e)}
-
-
-def correr_arima(df_train, df_test, usar_log=False):
-    """ARIMA con transformacion log opcional."""
-    try:
-        serie = df_train['y'].copy()
-        if usar_log:
-            serie = np.log1p(serie)
-        modelo = ARIMA(serie, order=(1, 1, 1))
-        res = modelo.fit()
-        pred = res.forecast(steps=len(df_test))
-        pred_vals = pred.values if hasattr(pred, 'values') else np.asarray(pred)
-        real = df_test['y'].values
-        if usar_log:
-            pred_vals = np.expm1(pred_vals)
-        pred_vals = np.clip(pred_vals, 0, None)
-        mape = calcular_mape(real, pred_vals)
-        mae = mean_absolute_error(real, pred_vals)
-        return {
-            'nombre': 'ARIMA', 'mape': round(mape, 2),
-            'mae': round(mae, 2), 'modelo': res,
-            'pred_test': pred_vals, 'usar_log': usar_log
-        }
-    except Exception as e:
-        return {'nombre': 'ARIMA', 'mape': 999, 'mae': 999, 'error': str(e)}
-
-
-def correr_autoarima(df_train, df_test, usar_log=False):
-    if not HAS_PMDARIMA:
-        return {'nombre': 'AutoARIMA', 'mape': 999, 'mae': 999,
-                'error': 'Instala: pip install pmdarima'}
-    try:
-        serie = df_train['y'].copy()
-        if usar_log:
-            serie = np.log1p(serie)
-        seasonal = len(df_train) >= 60
-        modelo = auto_arima(
-            serie,
-            seasonal=seasonal,
-            m=7 if seasonal else 1,
-            stepwise=True,
-            suppress_warnings=True,
-            max_p=5, max_d=2, max_q=5,
-            max_P=2, max_Q=2,
-            n_jobs=1, trace=False,
-            error_action='ignore'
-        )
-        pred = modelo.predict(n_periods=len(df_test))
-        pred_vals = np.asarray(pred)
-        real = df_test['y'].values
-        if usar_log:
-            pred_vals = np.expm1(pred_vals)
-        pred_vals = np.clip(pred_vals, 0, None)
-        mape = calcular_mape(real, pred_vals)
-        mae = mean_absolute_error(real, pred_vals)
-        return {
-            'nombre': 'AutoARIMA', 'mape': round(mape, 2),
-            'mae': round(mae, 2), 'modelo': modelo,
-            'pred_test': pred_vals, 'usar_log': usar_log
-        }
-    except Exception as e:
-        return {'nombre': 'AutoARIMA', 'mape': 999, 'mae': 999, 'error': str(e)}
-
-
-def _features_test_sin_leakage(df_train, df_test, usar_log=False):
-    """Genera features de test usando solo historia disponible (sin ver ventas futuras)."""
-    history = df_train.copy().reset_index(drop=True)
-    bloques = []
-
-    for i in range(len(df_test)):
-        fila = df_test.iloc[[i]].copy()
-        fila['y'] = np.nan
-        ventana = pd.concat([history, fila], ignore_index=True)
-        feat = crear_features_v3(ventana, usar_log=usar_log).tail(1)
-        bloques.append(feat)
-        history = pd.concat(
-            [history, df_test.iloc[[i]][['ds', 'y']].reset_index(drop=True)],
-            ignore_index=True
-        )
-
-    return pd.concat(bloques, ignore_index=True)
-
-
-def correr_xgboost_v3(df_train, df_test, usar_log=False):
-    """XGBoost con features v3 y validacion interna (sin leakage en test)."""
-    if not HAS_XGBOOST:
-        return {'nombre': 'XGBoost', 'mape': 999, 'mae': 999,
-                'error': 'Instala: pip install xgboost'}
-    try:
-        df_train_f = crear_features_v3(df_train.copy(), usar_log=usar_log)
-        df_test_f = _features_test_sin_leakage(df_train, df_test, usar_log=usar_log)
-
-        feature_cols = [c for c in df_train_f.columns
-                        if c not in ['ds', 'y', 'y_raw']]
-
-        X_all = df_train_f[feature_cols]
-        y_all = df_train_f['y']
-        X_test = df_test_f[feature_cols]
-        y_test = df_test['y'].values
-
-        # Early stopping solo con cola del train (evita leakage)
-        val_size = max(14, int(len(X_all) * 0.15))
-        X_tr, X_val = X_all.iloc[:-val_size], X_all.iloc[-val_size:]
-        y_tr, y_val = y_all.iloc[:-val_size], y_all.iloc[-val_size:]
-
-        modelo = xgb.XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.03,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.3,
-            reg_lambda=1.5,
-            min_child_weight=3,
-            random_state=42,
-            early_stopping_rounds=25,
-            eval_metric='mae'
-        )
-        modelo.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-
-        pred = modelo.predict(X_test)
-        if usar_log:
-            pred = np.expm1(pred)
-            y_test_eval = np.expm1(y_test)
-        else:
-            y_test_eval = y_test
-
-        pred = np.clip(pred, 0, None)
-        mape = calcular_mape(y_test_eval, pred)
-        mae = mean_absolute_error(y_test_eval, pred)
-
-        importance = dict(zip(feature_cols, modelo.feature_importances_))
-        top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:5]
-
-        return {
-            'nombre': 'XGBoost',
-            'mape': round(mape, 2),
-            'mae': round(mae, 2),
-            'modelo': modelo,
-            'feature_cols': feature_cols,
-            'top_features': top_features,
-            'pred_test': pred,
-            'usar_log': usar_log
-        }
-    except Exception as e:
-        return {'nombre': 'XGBoost', 'mape': 999, 'mae': 999, 'error': str(e)}
 
 # ============================================
-# VALIDACION WALK FORWARD + ENSEMBLE
+# MODELOS
+# Todos comparten la misma firma: (df_train, horizonte, ctx) -> DataFrame(ds, yhat)
+# Asi el modelo que se valida es EXACTAMENTE el que produce el forecast final.
 # ============================================
 
-def walk_forward_validation(df, pais, window_test=30, usar_log=False):
-    """Valida en los ultimos N dias con ventana adaptativa."""
-    df = df.sort_values('ds').reset_index(drop=True)
-    n = len(df)
-    window_test = min(window_test, max(14, int(n * 0.2)))
-    fecha_corte = df['ds'].max() - pd.Timedelta(days=window_test)
+def _recortar_outliers(df, p=0.99):
+    """Winsoriza con umbral calculado SOLO con los datos de entrenamiento."""
+    df = df.copy()
+    abiertos = df['y'][df.get('cerrado', 0) == 0] if 'cerrado' in df else df['y']
+    if len(abiertos) < 30:
+        return df
+    hi = abiertos.quantile(p)
+    lo = abiertos.quantile(1 - p)
+    df['y'] = df['y'].clip(lower=max(lo, 0), upper=hi)
+    return df
 
-    if (df['ds'].max() - fecha_corte).days < 14:
-        split = int(n * 0.8)
-        df_train = df.iloc[:split].copy()
-        df_test = df.iloc[split:].copy()
-    else:
-        df_train = df[df['ds'] <= fecha_corte].copy()
-        df_test = df[df['ds'] > fecha_corte].copy()
 
-    if len(df_train) < 30:
-        return None, "Pocos datos para entrenar (< 30 dias)"
+def _tr(y, usar_log):
+    return np.log1p(np.clip(np.asarray(y, dtype=float), 0, None)) if usar_log else np.asarray(y, dtype=float)
 
-    df_train_fit = df_train.copy()
-    df_test_eval = df_test.copy()
+
+def _inv(z, usar_log):
+    z = np.asarray(z, dtype=float)
     if usar_log:
-        df_train_fit = df_train_fit.copy()
-        df_train_fit['y'] = np.log1p(df_train_fit['y'])
-
-    anos = df['ds'].dt.year.unique().tolist()
-    anos += [max(anos) + 1]
-    feriados = obtener_feriados(pais, anos)
-
-    res_prophet = correr_prophet_mejorado(df_train_fit, df_test_eval, feriados, usar_log=usar_log)
-    res_arima = correr_arima(df_train, df_test, usar_log=usar_log)
-    res_autoarima = correr_autoarima(df_train, df_test, usar_log=usar_log)
-    res_xgb = correr_xgboost_v3(df_train, df_test, usar_log=usar_log)
-
-    resultados = [res_prophet, res_arima, res_autoarima, res_xgb]
-    validos = [r for r in resultados if r.get('mape', 999) < 100 and 'pred_test' in r]
-
-    if not validos:
-        return None, "Ningun modelo convergio"
-
-    validos.sort(key=lambda x: x['mape'])
-    return validos, df_train, df_test, feriados
+        z = np.expm1(np.clip(z, -20, 30))
+    return np.clip(z, 0, None)
 
 
-def ensemble_ponderado(resultados, real_test):
-    """Combina predicciones de los 2-3 mejores modelos (peso inverso al MAPE)."""
-    buenos = [r for r in resultados if r.get('mape', 999) < 50 and 'pred_test' in r]
-    if not buenos:
-        buenos = [resultados[0]]
-    if len(buenos) == 1:
-        r = buenos[0]
-        return {
-            'nombre': r['nombre'],
-            'mape': r['mape'],
-            'mae': r['mae'],
-            'modelos': [r],
-            'pesos': [1.0],
-            'pred_test': r['pred_test'],
-            'modelo_base': r
-        }
-
-    buenos = buenos[:3]
-    pesos = np.array([1 / max(r['mape'], 0.5) for r in buenos], dtype=float)
-    pesos = pesos / pesos.sum()
-
-    preds = np.column_stack([r['pred_test'] for r in buenos])
-    pred_e = np.clip((preds * pesos).sum(axis=1), 0, None)
-    mape_e = calcular_mape(real_test, pred_e)
-    mae_e = mean_absolute_error(real_test, pred_e)
-    nombres = '+'.join([r['nombre'] for r in buenos])
-
-    return {
-        'nombre': f'Ensemble ({nombres})',
-        'mape': round(mape_e, 2),
-        'mae': round(mae_e, 2),
-        'modelos': buenos,
-        'pesos': pesos.tolist(),
-        'pred_test': pred_e,
-        'modelo_base': buenos[0]
-    }
+def _fechas_futuras(df_train, horizonte):
+    return pd.date_range(start=df_train['ds'].max() + pd.Timedelta(days=1),
+                         periods=horizonte, freq='D')
 
 
-def _predecir_prophet_final(df, dias_futuro, feriados, usar_log=False):
-    df_fit = df.copy()
-    if usar_log:
-        df_fit['y'] = np.log1p(df_fit['y'])
+def _df_entrenable(df_train, usar_log):
+    """Serie de entrenamiento: sin dias cerrados y en la escala del modelo."""
+    d = df_train.copy()
+    if 'cerrado' in d:
+        d = d[d['cerrado'] == 0]
+    d = d[['ds', 'y']].dropna().reset_index(drop=True)
+    d['y'] = _tr(d['y'], usar_log)
+    return d
 
+
+def modelo_baseline(df_train, horizonte, ctx):
+    """
+    Baseline estacional: nivel robusto reciente x perfil de dia de semana.
+    Sirve de piso de comparacion; en series muy ruidosas suele ganar a todo.
+    """
+    d = _df_entrenable(df_train, usar_log=False)
+    if len(d) < 14:
+        return None
+    ult = d.tail(28)
+    nivel = float(ult['y'].median())
+    perfil = ult.assign(dow=ult['ds'].dt.dayofweek).groupby('dow')['y'].median()
+    perfil = (perfil / max(nivel, 1e-6)).clip(0.4, 2.0)
+    fechas = _fechas_futuras(df_train, horizonte)
+    factor = np.array([perfil.get(f.dayofweek, 1.0) for f in fechas])
+    return pd.DataFrame({'ds': fechas, 'yhat': np.clip(nivel * factor, 0, None)})
+
+
+def modelo_prophet(df_train, horizonte, ctx):
+    d = _df_entrenable(df_train, ctx['usar_log'])
+    if len(d) < 30:
+        return None
+    usar_reg = len(d) > 60
     modelo = Prophet(
-        weekly_seasonality=len(df) > 30,
-        yearly_seasonality=len(df) > 365,
+        weekly_seasonality=len(d) > 30,
+        yearly_seasonality=len(d) > 540,
         daily_seasonality=False,
-        interval_width=0.95,
-        holidays=feriados,
-        changepoint_prior_scale=0.15,
-        seasonality_mode='multiplicative',
+        interval_width=0.8,
+        holidays=ctx.get('feriados'),
+        # Series diarias de ventas son ruidosas: 0.15 sobreajustaba la tendencia
+        # y la extrapolaba al futuro. 0.03 da una tendencia mucho mas estable.
+        changepoint_prior_scale=ctx.get('cps', 0.03),
+        seasonality_prior_scale=ctx.get('sps', 8.0),
+        seasonality_mode='multiplicative' if (not ctx['usar_log'] and ctx.get('multiplicativo', True)) else 'additive',
         changepoint_range=0.9
     )
+    if usar_reg:
+        for r in REGRESSORS_PROPHET:
+            modelo.add_regressor(r, standardize=False)
+        cal = features_calendario(d['ds'])
+        d = pd.concat([d, cal[REGRESSORS_PROPHET]], axis=1)
 
-    regressors = []
-    if len(df) > 60:
-        df_f = crear_features_v3(df.copy(), usar_log=False)
-        regressors = ['es_finde', 'es_quincena', 'es_fin_mes']
-        for r in regressors:
-            modelo.add_regressor(r)
-        df_reg = df_fit.merge(df_f[['ds'] + regressors], on='ds', how='left')
-        df_reg[regressors] = df_reg[regressors].fillna(0)
-    else:
-        df_reg = df_fit.copy()
-
-    modelo.fit(df_reg)
-    futuro = modelo.make_future_dataframe(periods=dias_futuro, freq='D')
-
-    if regressors:
-        futuro['dia_semana'] = futuro['ds'].dt.dayofweek
-        futuro['es_finde'] = (futuro['dia_semana'] >= 5).astype(int)
-        futuro['dia_mes'] = futuro['ds'].dt.day
-        futuro['es_quincena'] = ((futuro['dia_mes'] >= 14) & (futuro['dia_mes'] <= 16)).astype(int)
-        futuro['es_fin_mes'] = futuro['dia_mes'].isin([28, 29, 30, 31]).astype(int)
-        futuro = futuro.drop(columns=['dia_semana', 'dia_mes'])
-
+    modelo.fit(d)
+    fechas = _fechas_futuras(df_train, horizonte)
+    futuro = pd.DataFrame({'ds': fechas})
+    if usar_reg:
+        futuro = pd.concat([futuro, features_calendario(fechas)[REGRESSORS_PROPHET]], axis=1)
     pred = modelo.predict(futuro)
-    if usar_log:
-        for col in ['yhat', 'yhat_lower', 'yhat_upper']:
-            pred[col] = np.expm1(pred[col])
-        pred[['yhat', 'yhat_lower', 'yhat_upper']] = pred[['yhat', 'yhat_lower', 'yhat_upper']].clip(lower=0)
 
-    return pred
-
-
-def _predecir_xgboost_final(df, dias_futuro, usar_log=False):
-    df_train_f = crear_features_v3(df.copy(), usar_log=usar_log)
-    feature_cols = [c for c in df_train_f.columns if c not in ['ds', 'y', 'y_raw']]
-
-    val_size = max(14, int(len(df_train_f) * 0.15))
-    X_all, y_all = df_train_f[feature_cols], df_train_f['y']
-    X_tr, X_val = X_all.iloc[:-val_size], X_all.iloc[-val_size:]
-    y_tr, y_val = y_all.iloc[:-val_size], y_all.iloc[-val_size:]
-
-    modelo = xgb.XGBRegressor(
-        n_estimators=300, max_depth=5, learning_rate=0.03,
-        subsample=0.8, colsample_bytree=0.8, reg_alpha=0.3, reg_lambda=1.5,
-        min_child_weight=3, random_state=42,
-        early_stopping_rounds=25, eval_metric='mae'
-    )
-    modelo.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-
-    history = df.copy().reset_index(drop=True)
-    filas = []
-    ultima = history['ds'].max()
-
-    for d in range(1, dias_futuro + 1):
-        fecha = ultima + pd.Timedelta(days=d)
-        fila = pd.DataFrame({'ds': [fecha], 'y': [np.nan]})
-        ventana = pd.concat([history, fila], ignore_index=True)
-        feat = crear_features_v3(ventana, usar_log=usar_log).tail(1)
-        pred = float(modelo.predict(feat[feature_cols])[0])
-        if usar_log:
-            pred = float(np.expm1(pred))
-        pred = max(0.0, pred)
-        filas.append({'ds': fecha, 'yhat': pred, 'yhat_lower': pred * 0.85, 'yhat_upper': pred * 1.15})
-        history = pd.concat([history, pd.DataFrame({'ds': [fecha], 'y': [pred]})], ignore_index=True)
-
-    hist_df = df.copy()
-    hist_df['yhat'] = hist_df['y']
-    hist_df['yhat_lower'] = hist_df['y']
-    hist_df['yhat_upper'] = hist_df['y']
-    fut_df = pd.DataFrame(filas)
-    return pd.concat([hist_df[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], fut_df], ignore_index=True)
+    out = pd.DataFrame({'ds': fechas})
+    out['yhat'] = _inv(pred['yhat'].values, ctx['usar_log'])
+    out['yhat_lower'] = _inv(pred['yhat_lower'].values, ctx['usar_log'])
+    out['yhat_upper'] = _inv(pred['yhat_upper'].values, ctx['usar_log'])
+    return out
 
 
-def _predecir_arima_final(df, dias_futuro, res_modelo, usar_log=False):
-    serie = df['y'].copy()
-    if usar_log:
-        serie = np.log1p(serie)
-    try:
-        if HAS_PMDARIMA and res_modelo.get('nombre') == 'AutoARIMA':
-            modelo = auto_arima(
-                serie, seasonal=len(df) >= 60, m=7 if len(df) >= 60 else 1,
-                stepwise=True, suppress_warnings=True, max_p=5, max_d=2, max_q=5,
-                n_jobs=1, trace=False, error_action='ignore'
-            )
-            pred_f = modelo.predict(n_periods=dias_futuro)
-        else:
-            modelo = ARIMA(serie, order=(1, 1, 1)).fit()
-            pred_f = modelo.forecast(steps=dias_futuro)
-        pred_f = np.asarray(pred_f)
-        if usar_log:
-            pred_f = np.expm1(pred_f)
-        pred_f = np.clip(pred_f, 0, None)
+def modelo_sarima(df_train, horizonte, ctx):
+    """AutoARIMA estacional (m=7) si pmdarima esta disponible; si no, SARIMAX fijo."""
+    d = _df_entrenable(df_train, ctx['usar_log'])
+    if len(d) < 40:
+        return None
+    serie = d['y'].to_numpy()
+    fechas = _fechas_futuras(df_train, horizonte)
+    estacional = len(serie) >= 70
 
-        fechas = pd.date_range(start=df['ds'].max() + pd.Timedelta(days=1), periods=dias_futuro, freq='D')
-        hist_df = df.copy()
-        hist_df['yhat'] = hist_df['y']
-        hist_df['yhat_lower'] = hist_df['y']
-        hist_df['yhat_upper'] = hist_df['y']
-        fut_df = pd.DataFrame({
-            'ds': fechas,
-            'yhat': pred_f,
-            'yhat_lower': pred_f * 0.85,
-            'yhat_upper': pred_f * 1.15
-        })
-        return pd.concat([hist_df[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], fut_df], ignore_index=True)
-    except Exception:
-        return _predecir_prophet_final(df, dias_futuro, None, usar_log)
-
-
-def analizar_v3(df, pais, dias_futuro, usar_log=False):
-    """Pipeline completo con ensemble real y modelo final alineado."""
-    out = walk_forward_validation(df, pais, window_test=30, usar_log=usar_log)
-    if out[0] is None:
-        return None, None, out[1]
-
-    resultados, df_train, df_test, feriados = out
-    real_test = df_test['y'].values
-    ganador = ensemble_ponderado(resultados, real_test)
-
-    base = ganador.get('modelo_base', resultados[0])
-    nombre_base = base['nombre']
-
-    if 'XGBoost' in nombre_base and len(ganador.get('modelos', [])) == 1:
-        prediccion = _predecir_xgboost_final(df, dias_futuro, usar_log)
-    elif nombre_base in ('ARIMA', 'AutoARIMA') and len(ganador.get('modelos', [])) == 1:
-        prediccion = _predecir_arima_final(df, dias_futuro, base, usar_log)
+    if HAS_PMDARIMA:
+        modelo = auto_arima(
+            serie, seasonal=estacional, m=7 if estacional else 1,
+            d=None, D=1 if estacional else 0,
+            start_p=0, start_q=0, max_p=3, max_q=3, max_P=1, max_Q=1,
+            stepwise=True, suppress_warnings=True, error_action='ignore',
+            information_criterion='aicc', n_jobs=1, trace=False
+        )
+        pred = np.asarray(modelo.predict(n_periods=horizonte))
     else:
-        prediccion = _predecir_prophet_final(df, dias_futuro, feriados, usar_log)
+        orden_est = (1, 0, 1, 7) if estacional else (0, 0, 0, 0)
+        res = SARIMAX(serie, order=(1, 1, 1), seasonal_order=orden_est,
+                      enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+        pred = np.asarray(res.forecast(steps=horizonte))
 
-    metricas = {
-        'modelo_ganador': ganador['nombre'],
-        'MAPE': ganador['mape'],
-        'MAE': ganador['mae'],
-        'Precision': max(0, round(100 - ganador['mape'], 2)),
-        'prophet_mape': next((r['mape'] for r in resultados if 'Prophet' in r['nombre']), None),
-        'arima_mape': next((r['mape'] for r in resultados if r['nombre'] == 'ARIMA'), None),
-        'autoarima_mape': next((r['mape'] for r in resultados if r['nombre'] == 'AutoARIMA'), None),
-        'xgboost_mape': next((r['mape'] for r in resultados if r['nombre'] == 'XGBoost'), None),
+    return pd.DataFrame({'ds': fechas, 'yhat': _inv(pred, ctx['usar_log'])})
+
+
+def _xgb_regresor(n_estimators):
+    return xgb.XGBRegressor(
+        n_estimators=n_estimators, max_depth=4, learning_rate=0.05,
+        subsample=0.9, colsample_bytree=0.9, reg_alpha=0.1, reg_lambda=2.0,
+        min_child_weight=5, random_state=42, n_jobs=2, eval_metric='mae'
+    )
+
+
+def modelo_xgboost(df_train, horizonte, ctx):
+    """
+    XGBoost recursivo. Dos correcciones importantes:
+      - el early stopping se usa solo para elegir n_estimators y luego se
+        reentrena con TODO el train (antes el modelo final perdia el 15% final,
+        que es justo la parte mas informativa).
+      - la prediccion multi-paso es recursiva con sus propias predicciones,
+        igual en validacion y en produccion (antes la validacion se alimentaba
+        con las ventas reales del test: leakage y MAPE optimista).
+    """
+    if not HAS_XGBOOST:
+        return None
+    d = _df_entrenable(df_train, ctx['usar_log'])
+    if len(d) < 60:
+        return None
+
+    feriados_set = ctx.get('feriados_set')
+    feats = crear_features_v3(d, feriados_set)
+    cols = columnas_features(feats)
+    entren = feats.dropna(subset=cols)
+    if len(entren) < 40:
+        return None
+
+    X, y = entren[cols], entren['y']
+    val_size = int(np.clip(len(X) * 0.15, 14, 60))
+    if len(X) - val_size >= 30:
+        es = _xgb_regresor(600)
+        es.set_params(early_stopping_rounds=40)
+        es.fit(X.iloc[:-val_size], y.iloc[:-val_size],
+               eval_set=[(X.iloc[-val_size:], y.iloc[-val_size:])], verbose=False)
+        n_arboles = max(50, int(getattr(es, 'best_iteration', 250) or 250))
+    else:
+        n_arboles = 250
+
+    modelo = _xgb_regresor(n_arboles)
+    modelo.fit(X, y, verbose=False)
+
+    # Forecast recursivo
+    historia = d.copy()
+    fechas = _fechas_futuras(df_train, horizonte)
+    preds = []
+    for fecha in fechas:
+        ventana = pd.concat(
+            [historia.tail(80), pd.DataFrame({'ds': [fecha], 'y': [np.nan]})],
+            ignore_index=True
+        )
+        fila = crear_features_v3(ventana, feriados_set).tail(1)
+        assert fila['ds'].iloc[0] == fecha
+        z = float(modelo.predict(fila[cols])[0])
+        preds.append(z)
+        historia = pd.concat([historia, pd.DataFrame({'ds': [fecha], 'y': [z]})],
+                             ignore_index=True)
+
+    out = pd.DataFrame({'ds': fechas, 'yhat': _inv(preds, ctx['usar_log'])})
+    imp = sorted(zip(cols, modelo.feature_importances_), key=lambda x: x[1], reverse=True)[:5]
+    out.attrs['top_features'] = [(c, round(float(v), 3)) for c, v in imp]
+    return out
+
+
+MODELOS = [
+    ('Baseline estacional', modelo_baseline),
+    ('Prophet', modelo_prophet),
+    ('AutoARIMA' if HAS_PMDARIMA else 'SARIMA', modelo_sarima),
+    ('XGBoost', modelo_xgboost),
+]
+
+
+# ============================================
+# WALK FORWARD VALIDATION (VARIOS CORTES) + ENSEMBLE
+# ============================================
+
+def construir_folds(df, horizonte, n_folds):
+    """Cortes expansivos: [.. t] entrena, (t, t+h] evalua. Sin solapamiento."""
+    n = len(df)
+    folds = []
+    for k in range(n_folds, 0, -1):
+        fin = n - (k - 1) * horizonte
+        ini = fin - horizonte
+        if ini < 40:  # minimo de historia para entrenar algo util
+            continue
+        folds.append((df.iloc[:ini].copy(), df.iloc[ini:fin].copy()))
+    return folds
+
+
+def _pesos_desde_errores(errores, max_modelos=3):
+    """Pesos ~ 1/error^2 sobre los mejores modelos (y solo si son competitivos)."""
+    validos = {k: v for k, v in errores.items() if np.isfinite(v) and v < 100}
+    if not validos:
+        return {}
+    orden = sorted(validos.items(), key=lambda x: x[1])
+    mejor = orden[0][1]
+    elegidos = [(k, v) for k, v in orden[:max_modelos] if v <= mejor * 1.35]
+    pesos = np.array([1.0 / max(v, 0.5) ** 2 for _, v in elegidos])
+    pesos = pesos / pesos.sum()
+    return {k: float(p) for (k, _), p in zip(elegidos, pesos)}
+
+
+def walk_forward_validation(df, pais, horizonte=30, n_folds=3, usar_log=False, progreso=None):
+    """
+    Valida con varios cortes temporales (no uno solo). Devuelve metricas
+    promediadas por modelo, el ensemble evaluado de forma honesta (los pesos
+    de cada fold vienen de folds anteriores) y los pesos finales.
+    """
+    df = df.sort_values('ds').reset_index(drop=True)
+    n_abiertos = int((df.get('cerrado', pd.Series(0, index=df.index)) == 0).sum())
+    if n_abiertos < 45:
+        return None, "Pocos datos para validar (< 45 dias con ventas)"
+
+    horizonte = int(np.clip(horizonte, 7, max(14, int(len(df) * 0.25))))
+    n_folds = max(1, min(n_folds, max(1, (len(df) - 40) // horizonte)))
+    folds = construir_folds(df, horizonte, n_folds)
+    if not folds:
+        return None, "Serie demasiado corta para validacion temporal"
+
+    anos = sorted(df['ds'].dt.year.unique().tolist())
+    anos = anos + [anos[-1] + 1]
+    feriados = obtener_feriados(pais, anos)
+    ctx = {
+        'usar_log': usar_log,
+        'feriados': feriados,
+        'feriados_set': set(feriados['ds'].dt.normalize()) if feriados is not None else None,
     }
 
+    errores_por_fold = []   # [{modelo: wape}]
+    metricas_modelo = {}    # {modelo: [dict metricas]}
+    ensemble_metricas = []
+    pred_ens_rel = []       # errores relativos del ensemble (para intervalos)
+    total = len(folds) * len(MODELOS)
+    hecho = 0
+
+    for df_train, df_test in folds:
+        df_train_w = _recortar_outliers(df_train)
+        mask = (df_test.get('cerrado', 0) == 0).values if 'cerrado' in df_test else np.ones(len(df_test), bool)
+        real = df_test['y'].to_numpy(dtype=float)
+        preds_fold = {}
+        errs_fold = {}
+
+        for nombre, fn in MODELOS:
+            hecho += 1
+            if progreso:
+                progreso(hecho / total, nombre)
+            try:
+                out = fn(df_train_w, len(df_test), ctx)
+            except Exception:
+                out = None
+            if out is None or out['yhat'].isna().any():
+                continue
+            yhat = out['yhat'].to_numpy(dtype=float)[:len(df_test)]
+            if len(yhat) != len(df_test):
+                continue
+            if 'cerrado' in df_test:
+                yhat = np.where(df_test['cerrado'].values == 1, 0.0, yhat)
+            m = calcular_metricas(real, yhat, mask)
+            if m['wape'] >= 100:
+                continue
+            preds_fold[nombre] = yhat
+            errs_fold[nombre] = m['wape']
+            metricas_modelo.setdefault(nombre, []).append(m)
+
+        if not preds_fold:
+            continue
+
+        # Ensemble honesto: pesos calculados con folds ANTERIORES
+        historicos = {}
+        for e in errores_por_fold:
+            for k, v in e.items():
+                historicos.setdefault(k, []).append(v)
+        pesos_previos = _pesos_desde_errores(
+            {k: float(np.mean(v)) for k, v in historicos.items() if k in preds_fold}
+        ) if historicos else {}
+        if not pesos_previos:
+            pesos_previos = {k: 1.0 / len(preds_fold) for k in preds_fold}
+
+        suma = sum(pesos_previos.get(k, 0) for k in preds_fold)
+        if suma > 0:
+            mezcla = sum(preds_fold[k] * (pesos_previos.get(k, 0) / suma) for k in preds_fold)
+            ensemble_metricas.append(calcular_metricas(real, mezcla, mask))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                rel = np.where((real > 0) & mask, mezcla / np.maximum(real, 1e-6), np.nan)
+            pred_ens_rel.extend([v for v in rel if np.isfinite(v)])
+
+        errores_por_fold.append(errs_fold)
+
+    if not metricas_modelo:
+        return None, "Ningun modelo convergio"
+
+    resumen = {}
+    for nombre, lista in metricas_modelo.items():
+        resumen[nombre] = {k: round(float(np.mean([m[k] for m in lista])), 2)
+                           for k in ('mape', 'wape', 'smape', 'mae')}
+        resumen[nombre]['folds'] = len(lista)
+
+    pesos_finales = _pesos_desde_errores({k: v['wape'] for k, v in resumen.items()})
+
+    if ensemble_metricas:
+        ens = {k: round(float(np.mean([m[k] for m in ensemble_metricas])), 2)
+               for k in ('mape', 'wape', 'smape', 'mae')}
+    else:
+        mejor = min(resumen.items(), key=lambda x: x[1]['wape'])
+        ens = dict(mejor[1])
+    ens['folds'] = len(ensemble_metricas) or 1
+
+    # Intervalo empirico a partir de los errores de validacion del ensemble
+    if len(pred_ens_rel) >= 20:
+        ratios = np.array(pred_ens_rel)
+        banda = (float(np.quantile(ratios, 0.9)), float(np.quantile(ratios, 0.1)))
+    else:
+        banda = (1.25, 0.8)
+
+    return {
+        'resumen': resumen,
+        'ensemble': ens,
+        'pesos': pesos_finales,
+        'ctx': ctx,
+        'horizonte_validacion': horizonte,
+        'n_folds': len(folds),
+        'banda': banda,
+    }, None
+
+
+def _forecast_final(df, dias_futuro, ctx, pesos, banda):
+    """Reentrena los modelos del ensemble con TODA la serie y combina con los mismos pesos."""
+    df_w = _recortar_outliers(df)
+    fn_por_nombre = dict(MODELOS)
+    salidas, usados = {}, {}
+    intervalo_modelo = None
+
+    for nombre, peso in sorted(pesos.items(), key=lambda x: -x[1]):
+        fn = fn_por_nombre.get(nombre)
+        if fn is None:
+            continue
+        try:
+            out = fn(df_w, dias_futuro, ctx)
+        except Exception:
+            out = None
+        if out is None or out['yhat'].isna().any():
+            continue
+        salidas[nombre] = out
+        usados[nombre] = peso
+        if 'yhat_lower' in out and intervalo_modelo is None:
+            intervalo_modelo = out
+
+    if not salidas:
+        raise RuntimeError("No se pudo generar el pronostico final")
+
+    total = sum(usados.values())
+    usados = {k: v / total for k, v in usados.items()}
+    fechas = next(iter(salidas.values()))['ds']
+    yhat = sum(salidas[k]['yhat'].to_numpy(dtype=float) * w for k, w in usados.items())
+
+    fut = pd.DataFrame({'ds': fechas, 'yhat': np.clip(yhat, 0, None)})
+    if 'cerrado' in df:
+        cerrados = set(df.loc[df['cerrado'] == 1, 'ds'].dt.dayofweek.unique())
+        if cerrados:
+            fut.loc[fut['ds'].dt.dayofweek.isin(cerrados), 'yhat'] = 0.0
+
+    q_alto, q_bajo = banda
+    fut['yhat_lower'] = np.clip(fut['yhat'] / max(q_alto, 1.01), 0, None)
+    fut['yhat_upper'] = fut['yhat'] / min(max(q_bajo, 0.3), 0.99)
+
+    hist = df[['ds', 'y']].copy()
+    hist['yhat'] = hist['y']
+    hist['yhat_lower'] = hist['y']
+    hist['yhat_upper'] = hist['y']
+    completo = pd.concat([hist[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], fut],
+                         ignore_index=True)
+    return completo, usados
+
+
+def analizar_v3(df, pais, dias_futuro, usar_log=False, n_folds=3, progreso=None):
+    """
+    Pipeline: walk-forward multi-corte -> pesos honestos -> reentreno con toda
+    la serie -> forecast del MISMO ensemble que se valido.
+    """
+    horizonte_val = int(np.clip(dias_futuro, 14, 30))
+    val, error = walk_forward_validation(
+        df, pais, horizonte=horizonte_val, n_folds=n_folds,
+        usar_log=usar_log, progreso=progreso
+    )
+    if val is None:
+        return None, None, error
+
+    try:
+        prediccion, pesos_usados = _forecast_final(
+            df, dias_futuro, val['ctx'], val['pesos'], val['banda']
+        )
+    except Exception as e:
+        return None, None, str(e)
+
+    nombres = '+'.join(pesos_usados.keys())
+    ens = val['ensemble']
+    metricas = {
+        'modelo_ganador': nombres if len(pesos_usados) > 1 else next(iter(pesos_usados)),
+        'MAPE': ens['mape'],
+        'WAPE': ens['wape'],
+        'sMAPE': ens['smape'],
+        'MAE': ens['mae'],
+        'Precision': max(0, round(100 - ens['mape'], 2)),
+        'folds': val['n_folds'],
+        'horizonte_validacion': val['horizonte_validacion'],
+        'pesos': {k: round(v, 3) for k, v in pesos_usados.items()},
+        'por_modelo': val['resumen'],
+        'usar_log': usar_log,
+    }
     return prediccion, metricas, None
 
 
@@ -780,10 +852,17 @@ def analizar_v3(df, pais, dias_futuro, usar_log=False):
 # ANALISIS Y RECOMENDACIONES
 # ============================================
 
+def solo_dias_abiertos(df):
+    """Excluye los dias cerrados: sus ceros no son ventas caidas."""
+    if 'cerrado' in df.columns:
+        return df[df['cerrado'] == 0].reset_index(drop=True)
+    return df
+
+
 def obtener_mejor_dia(df):
     dias_nombres = ['Lunes', 'Martes', 'Miercoles', 'Jueves',
                     'Viernes', 'Sabado', 'Domingo']
-    df_temp = df.copy()
+    df_temp = solo_dias_abiertos(df).copy()
     df_temp['dia'] = df_temp['ds'].dt.dayofweek
     ventas = df_temp.groupby('dia')['y'].mean()
     if ventas.sum() == 0:
@@ -793,6 +872,7 @@ def obtener_mejor_dia(df):
 
 
 def detectar_cambio_tendencia(df, window=14):
+    df = solo_dias_abiertos(df)
     if len(df) < window * 2:
         return {'hay_cambio': False}
     ultimos = df['y'].tail(window)
@@ -808,10 +888,11 @@ def detectar_cambio_tendencia(df, window=14):
 
 def generar_recomendaciones_v3(df, prediccion, metricas, info):
     recs = []
+    abiertos = solo_dias_abiertos(df)
 
     # 1. Tendencia general
-    primera = df['y'][:len(df)//2].mean()
-    segunda = df['y'][len(df)//2:].mean()
+    primera = abiertos['y'][:len(abiertos)//2].mean()
+    segunda = abiertos['y'][len(abiertos)//2:].mean()
     if primera > 0:
         if segunda > primera * 1.1:
             recs.append({'tipo': 'positivo',
@@ -839,7 +920,7 @@ def generar_recomendaciones_v3(df, prediccion, metricas, info):
 
     # 4. Proxima semana
     prox = prediccion[prediccion['ds'] > df['ds'].max()]['yhat'].head(7).sum()
-    ult = df['y'].tail(7).sum()
+    ult = df['y'].tail(7).sum()  # ultimos 7 dias de calendario, comparable con el forecast
     if ult > 0:
         cambio = (prox - ult) / ult * 100
         if cambio > 5:
@@ -871,9 +952,10 @@ def generar_recomendaciones_v3(df, prediccion, metricas, info):
 
 
 def evaluar_confiabilidad(df, mape):
+    abiertos = solo_dias_abiertos(df)
     dias = (df['ds'].max() - df['ds'].min()).days
-    pct_zeros = (df['y'] == 0).sum() / len(df) * 100
-    varianza = df['y'].std() / (df['y'].mean() if df['y'].mean() != 0 else 1)
+    pct_zeros = (abiertos['y'] == 0).sum() / max(len(abiertos), 1) * 100
+    varianza = abiertos['y'].std() / (abiertos['y'].mean() if abiertos['y'].mean() != 0 else 1)
 
     confianza = 0
     detalles = []
@@ -969,7 +1051,7 @@ def grafico_ventas_producto(df_raw, col_producto, col_ventas):
 
 def grafico_patron_dia_semana(df_raw, col_fecha, col_ventas):
     df_copy = df_raw.copy()
-    df_copy['fecha_dt'] = pd.to_datetime(df_copy[col_fecha], dayfirst=True, errors='coerce')
+    df_copy['fecha_dt'] = parsear_fechas(df_copy[col_fecha])[0]
     df_copy['dia_nombre'] = df_copy['fecha_dt'].dt.day_name()
     dias_orden = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
     dias_es = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miercoles',
@@ -1028,7 +1110,7 @@ def grafico_heatmap_rama_ciudad(df_raw, col_branch, col_ciudad, col_ventas):
 
 def tabla_comparacion_periodos(df_raw, col_fecha, col_ventas):
     df_copy = df_raw.copy()
-    df_copy['fecha_dt'] = pd.to_datetime(df_copy[col_fecha], dayfirst=True, errors='coerce')
+    df_copy['fecha_dt'] = parsear_fechas(df_copy[col_fecha])[0]
     fecha_corte = df_copy['fecha_dt'].min() + pd.Timedelta(days=(df_copy['fecha_dt'].max() - df_copy['fecha_dt'].min()).days // 2)
 
     p1 = df_copy[df_copy['fecha_dt'] < fecha_corte]
@@ -1105,7 +1187,8 @@ st.markdown(
 
 # --- Sidebar minimalista ---
 nombre_negocio = "Mi negocio"
-usar_log = False
+modo_log = "Automático"
+n_folds = 3
 
 with st.sidebar:
     st.markdown("**Ajustes**")
@@ -1119,10 +1202,15 @@ with st.sidebar:
 
     with st.expander("Opciones avanzadas"):
         nombre_negocio = st.text_input("Nombre del negocio", placeholder="Ej: Supermercado Central")
-        usar_log = st.toggle(
-            "Suavizar picos extremos",
-            value=False,
-            help="Actívalo si tus ventas varían mucho de un día a otro."
+        modo_log = st.radio(
+            "Suavizar picos extremos (log)",
+            ["Automático", "Sí", "No"],
+            index=0, horizontal=True,
+            help="Comprime los picos. En automático se activa solo si tus ventas son muy asimétricas."
+        )
+        n_folds = st.slider(
+            "Cortes de validación", 1, 4, 3,
+            help="Más cortes = medición del error más confiable, pero más lento."
         )
         if not HAS_PMDARIMA or not HAS_XGBOOST:
             st.caption("Tip: instala `pip install pmdarima xgboost` para comparar más modelos.")
@@ -1186,8 +1274,25 @@ if st.button("Generar predicción", type="primary", use_container_width=True):
     if info_val['estado'] == "WARNING":
         st.warning(info_val['mensaje'])
 
-    with st.spinner("Calculando predicción (puede tardar un minuto)..."):
-        prediccion, metricas, error = analizar_v3(df_limpio, pais, dias_futuro, usar_log=usar_log)
+    st.caption(
+        f"Fechas interpretadas como **{info_val['formato_fecha']}** "
+        f"({info_val['pct_no_parseadas']}% ilegibles) · "
+        f"{info_val['dias']} días con ventas"
+        + (f" · días cerrados detectados: {len(info_val['dias_cerrados'])}" if info_val['dias_cerrados'] else "")
+    )
+
+    usar_log = sugerir_log(df_limpio) if modo_log == "Automático" else (modo_log == "Sí")
+
+    barra = st.progress(0.0, text="Validando modelos...")
+
+    def _progreso(pct, nombre):
+        barra.progress(min(pct, 1.0), text=f"Validando {nombre}...")
+
+    prediccion, metricas, error = analizar_v3(
+        df_limpio, pais, dias_futuro,
+        usar_log=usar_log, n_folds=n_folds, progreso=_progreso
+    )
+    barra.empty()
 
     if error:
         st.error(f"No se pudo completar el análisis: {error}")
@@ -1306,21 +1411,27 @@ if st.button("Generar predicción", type="primary", use_container_width=True):
         for d in confianza['detalles']:
             st.caption(d)
 
-        st.markdown("**Comparación de modelos probados**")
-        cols_m = st.columns(4)
-        for i, (nom, mape) in enumerate([
-            ('Prophet', metricas.get('prophet_mape')),
-            ('ARIMA', metricas.get('arima_mape')),
-            ('AutoARIMA', metricas.get('autoarima_mape')),
-            ('XGBoost', metricas.get('xgboost_mape'))
-        ]):
-            with cols_m[i]:
-                if mape is not None and mape < 999:
-                    st.metric(nom, f"{mape}%", label="error MAPE")
-                else:
-                    st.caption(f"{nom}: no disponible")
+        st.caption(
+            f"Validación temporal: {metricas['folds']} corte(s) de "
+            f"{metricas['horizonte_validacion']} días · "
+            f"transformación log: {'sí' if metricas['usar_log'] else 'no'}"
+        )
+        st.caption(f"WAPE {metricas['WAPE']}% · sMAPE {metricas['sMAPE']}% · MAE ${metricas['MAE']:,.0f}")
 
-        st.caption("MAPE = error porcentual medio. Menor es mejor. Objetivo ideal: ≤15% con datos estables.")
+        st.markdown("**Comparación de modelos (promedio de todos los cortes)**")
+        tabla = pd.DataFrame([
+            {'Modelo': nom, 'MAPE %': m['mape'], 'WAPE %': m['wape'],
+             'MAE': m['mae'], 'Cortes': m['folds'],
+             'Peso en ensemble': metricas['pesos'].get(nom, 0)}
+            for nom, m in sorted(metricas['por_modelo'].items(), key=lambda x: x[1]['wape'])
+        ])
+        st.dataframe(tabla, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "MAPE = error porcentual medio sobre días con ventas. WAPE = error total / ventas totales "
+            "(no explota en días de venta baja) y es la métrica con la que se eligen y ponderan los modelos. "
+            "Objetivo ideal: ≤15% con datos estables."
+        )
 
     # --- Análisis por dimensión (colapsado) ---
     with st.expander("Análisis por sucursal, producto, ciudad…"):
