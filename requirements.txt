@@ -8,4 +8,5 @@ plotly
 holidays
 pmdarima
 xgboost
+lightgbm
 openpyxl

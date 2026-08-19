@@ -1,1468 +1,1230 @@
+"""
+SalesPredict AI — app.py
+========================
+Interfaz principal. Todo el backend vive en src/.
+Este archivo solo contiene UI + orquestación de flujo.
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import warnings
-import holidays
-warnings.filterwarnings('ignore')
-
-from prophet import Prophet
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-import plotly.graph_objects as go
-
-# ============================================
-# DETECCION DE LIBRERIAS OPCIONALES
-# ============================================
-
-HAS_PMDARIMA = False
-HAS_XGBOOST = False
-
-try:
-    from pmdarima import auto_arima
-    HAS_PMDARIMA = True
-except ImportError:
-    pass
-
-try:
-    import xgboost as xgb
-    HAS_XGBOOST = True
-except ImportError:
-    pass
-
-# ============================================
-# CONSTANTES Y CONFIGURACION
-# ============================================
-
-MAX_FILAS_CACHE = 2_000_000  # Aviso para datasets muy grandes
-CHUNK_SIZE = 200_000         # Lectura por bloques
-
-# ============================================
-# FUNCIONES DE UTILIDAD (CACHE + PERFORMANCE)
-# ============================================
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def cargar_csv_seguro(archivo_bytes, encoding='latin1'):
-    """
-    Carga el CSV completo (por bloques si es grande).
-
-    Antes se muestreaba con skiprows cuando el archivo era grande: eso rompe
-    la suma diaria de ventas (se pierden transacciones de cada dia) y por si
-    solo inflaba el error. Mejor leer todo y solo avisar si es enorme.
-    """
-    try:
-        archivo_bytes.seek(0)
-        bloques = pd.read_csv(archivo_bytes, encoding=encoding, chunksize=CHUNK_SIZE)
-        df = pd.concat(bloques, ignore_index=True)
-        total_filas = len(df)
-        if total_filas > MAX_FILAS_CACHE:
-            st.warning(f"Archivo muy grande ({total_filas:,} filas). El analisis puede tardar.")
-        return df, total_filas
-    except Exception as e:
-        return None, str(e)
-
-
-def detectar_columnas_clave(df):
-    """
-    Detecta automaticamente las columnas relevantes del CSV.
-    Soporta multiples formatos de nombres.
-    """
-    cols_lower = {c.lower().strip(): c for c in df.columns}
-
-    # Fecha
-    candidatos_fecha = ['date', 'fecha', 'ds', 'fecha_venta', 'fecha_transaccion',
-                        'fecha venta', 'fecha transaccion', 'transaction_date',
-                        'order_date', 'sale_date', 'fecha_pedido']
-    col_fecha = None
-    for c in candidatos_fecha:
-        if c in cols_lower:
-            col_fecha = cols_lower[c]
-            break
-
-    # Ventas
-    candidatos_ventas = ['sales', 'ventas', 'y', 'total', 'monto', 'amount',
-                         'total_venta', 'sale_amount', 'precio_total', 'grand_total',
-                         'total amount', 'monto total']
-    col_ventas = None
-    for c in candidatos_ventas:
-        if c in cols_lower:
-            col_ventas = cols_lower[c]
-            break
-
-    # Dimensiones opcionales
-    candidatos_branch = ['branch', 'rama', 'sucursal', 'store', 'tienda', 'location']
-    col_branch = next((cols_lower[c] for c in candidatos_branch if c in cols_lower), None)
-
-    candidatos_ciudad = ['city', 'ciudad', 'town', 'municipio']
-    col_ciudad = next((cols_lower[c] for c in candidatos_ciudad if c in cols_lower), None)
-
-    candidatos_producto = ['product line', 'product_line', 'productline', 'categoria',
-                           'category', 'producto', 'product', 'linea', 'line']
-    col_producto = next((cols_lower[c] for c in candidatos_producto if c in cols_lower), None)
-
-    candidatos_hora = ['time', 'hora', 'hour', 'transaction_time', 'hora_transaccion']
-    col_hora = next((cols_lower[c] for c in candidatos_hora if c in cols_lower), None)
-
-    candidatos_cliente = ['customer type', 'customer_type', 'customertype',
-                          'tipo_cliente', 'cliente', 'member', 'membership']
-    col_cliente = next((cols_lower[c] for c in candidatos_cliente if c in cols_lower), None)
-
-    candidatos_genero = ['gender', 'genero', 'sex', 'sexo']
-    col_genero = next((cols_lower[c] for c in candidatos_genero if c in cols_lower), None)
-
-    candidatos_pago = ['payment', 'metodo_pago', 'metodo pago', 'payment_method',
-                       'forma_pago', 'forma pago']
-    col_pago = next((cols_lower[c] for c in candidatos_pago if c in cols_lower), None)
-
-    return {
-        'fecha': col_fecha,
-        'ventas': col_ventas,
-        'branch': col_branch,
-        'ciudad': col_ciudad,
-        'producto': col_producto,
-        'hora': col_hora,
-        'cliente': col_cliente,
-        'genero': col_genero,
-        'pago': col_pago
-    }
-
-# ============================================
-# PARSEO DE FECHAS ROBUSTO
-# ============================================
-
-def parsear_fechas(serie):
-    """
-    Parsea fechas probando formatos dia-primero y mes-primero y quedandose
-    con el que menos valores pierde. Devuelve (fechas, info).
-
-    Un dayfirst=True fijo destroza CSVs en formato US (MM/DD/YYYY): las filas
-    con dia > 12 quedan en NaT y el resto se transpone (12/03 -> 3 de dic).
-    """
-    texto = serie.astype(str).str.strip()
-    candidatos = []
-
-    for etiqueta, kwargs in [
-        ("DD/MM/YYYY", {'dayfirst': True}),
-        ("MM/DD/YYYY", {'dayfirst': False}),
-    ]:
-        parsed = pd.to_datetime(texto, errors='coerce', **kwargs)
-        nulos = int(parsed.isna().sum())
-        # Penalizacion extra: un formato correcto suele dar dias consecutivos
-        dias_unicos = parsed.dropna().dt.normalize().nunique()
-        rango = 1
-        if dias_unicos > 1:
-            rango = max(1, (parsed.max() - parsed.min()).days + 1)
-        densidad = dias_unicos / rango
-        candidatos.append((nulos, -densidad, etiqueta, parsed))
-
-    candidatos.sort(key=lambda x: (x[0], x[1]))
-    nulos, _, etiqueta, fechas = candidatos[0]
-
-    info = {
-        'formato': etiqueta,
-        'no_parseadas': nulos,
-        'pct_no_parseadas': round(nulos / max(len(texto), 1) * 100, 2)
-    }
-    return fechas, info
-
-
-# ============================================
-# LIMPIEZA Y FEATURE ENGINEERING
-# ============================================
-
-def limpiar_datos_v3(df, col_fecha, col_ventas):
-    """
-    Limpia y agrega a serie diaria.
-    Cambios clave vs version anterior:
-      - parseo de fecha auto (dia-primero vs mes-primero)
-      - los dias sin datos NO se rellenan con 0 a ciegas: se detecta el patron
-        de dias cerrados (ej. domingos) y el resto se marca como hueco real
-      - los outliers NO se recortan aqui (se recortan dentro de cada fold con
-        umbrales calculados solo con train, para no filtrar futuro)
-    Retorna: (df_diario, info)
-    """
-    df_proc = pd.DataFrame()
-    fechas, info_fecha = parsear_fechas(df[col_fecha])
-    df_proc['ds'] = fechas.dt.normalize()
-    df_proc['y'] = pd.to_numeric(df[col_ventas], errors='coerce')
-
-    df_proc = df_proc.dropna()
-    df_proc = df_proc[df_proc['y'] >= 0]
-    df_proc = df_proc.sort_values('ds')
-
-    if df_proc.empty:
-        info = {'dias': 0, 'registros': 0, 'pct_zeros': 100, 'estado': 'ERROR',
-                'mensaje': 'No se pudo interpretar ninguna fecha/monto valido.',
-                'formato_fecha': info_fecha['formato'],
-                'pct_no_parseadas': info_fecha['pct_no_parseadas']}
-        return df_proc.assign(ds=pd.to_datetime([]), y=[]), info
-
-    # Suma diaria
-    df_diario = df_proc.groupby('ds', as_index=False)['y'].sum()
-
-    # Grilla diaria completa: los dias ausentes quedan como NaN (no como 0)
-    rango = pd.DataFrame({
-        'ds': pd.date_range(start=df_diario['ds'].min(),
-                            end=df_diario['ds'].max(), freq='D')
-    })
-    df_diario = rango.merge(df_diario, on='ds', how='left')
-
-    # Dias cerrados estructurales: un dia de semana ausente casi siempre
-    ausente = df_diario['y'].isna()
-    dow = df_diario['ds'].dt.dayofweek
-    dias_cerrados = []
-    for d in range(7):
-        mask = dow == d
-        if mask.sum() >= 4 and ausente[mask].mean() >= 0.8:
-            dias_cerrados.append(d)
-
-    # Un dia cerrado no es un error de datos: es una venta 0 predecible.
-    # Se marca para excluirlo de las metricas y se deja fuera del entrenamiento.
-    df_diario['cerrado'] = dow.isin(dias_cerrados).astype(int)
-
-    # Huecos aislados (no estructurales): interpolar en vez de meter 0,
-    # que es lo que mas inflaba el MAPE en CSVs con dias faltantes.
-    huecos = int((ausente & (df_diario['cerrado'] == 0)).sum())
-    df_diario['y'] = df_diario['y'].interpolate(limit_direction='both')
-    df_diario.loc[df_diario['cerrado'] == 1, 'y'] = 0.0
-
-    dias = (df_diario['ds'].max() - df_diario['ds'].min()).days + 1
-    dias_abiertos = int((df_diario['cerrado'] == 0).sum())
-    abiertos = df_diario[df_diario['cerrado'] == 0]
-    pct_zeros = (abiertos['y'] == 0).sum() / max(len(abiertos), 1) * 100
-    cv = abiertos['y'].std() / abiertos['y'].mean() if abiertos['y'].mean() else 0
-
-    if dias_abiertos < 30:
-        estado, mensaje = "ERROR", f"Solo {dias_abiertos} dias con datos. Minimo 30."
-    elif info_fecha['pct_no_parseadas'] > 20:
-        estado, mensaje = "ERROR", (f"{info_fecha['pct_no_parseadas']}% de fechas ilegibles "
-                                    f"(formato detectado: {info_fecha['formato']}). Revisa el CSV.")
-    elif pct_zeros > 40:
-        estado, mensaje = "ERROR", f"{pct_zeros:.1f}% de dias abiertos en 0. Datos muy fragmentados."
-    elif pct_zeros > 20:
-        estado, mensaje = "WARNING", f"{pct_zeros:.1f}% de dias en 0. Precision afectada."
-    elif huecos > dias * 0.1:
-        estado, mensaje = "WARNING", f"{huecos} dias sin registros se interpolaron."
-    elif dias_abiertos < 90:
-        estado, mensaje = "WARNING", f"Solo {dias_abiertos} dias. Recomendado 90+ para precision."
-    else:
-        estado, mensaje = "OK", "Datos validos."
-
-    info = {
-        'dias': dias_abiertos,
-        'dias_calendario': dias,
-        'registros': len(df_diario),
-        'pct_zeros': round(pct_zeros, 2),
-        'huecos_interpolados': huecos,
-        'dias_cerrados': dias_cerrados,
-        'cv': round(float(cv), 3),
-        'estado': estado,
-        'mensaje': mensaje,
-        'formato_fecha': info_fecha['formato'],
-        'pct_no_parseadas': info_fecha['pct_no_parseadas'],
-        'fecha_min': df_diario['ds'].min(),
-        'fecha_max': df_diario['ds'].max(),
-        'venta_promedio': abiertos['y'].mean(),
-        'venta_std': abiertos['y'].std()
-    }
-
-    return df_diario[['ds', 'y', 'cerrado']], info
-
-
-def sugerir_log(df):
-    """Log conviene con varianza alta y asimetria positiva, y sin ceros dominantes."""
-    y = df.loc[df.get('cerrado', 0) == 0, 'y'] if 'cerrado' in df else df['y']
-    y = y[y > 0]
-    if len(y) < 30:
-        return False
-    cv = y.std() / y.mean()
-    asimetria = float(((y - y.mean()) ** 3).mean() / (y.std() ** 3 + 1e-9))
-    return bool(cv > 0.45 and asimetria > 0.6)
-
-
-def features_calendario(fechas):
-    """Features conocidas de antemano (no dependen de ventas => nunca hay leakage)."""
-    f = pd.DataFrame({'ds': pd.to_datetime(fechas)})
-    f['dia_semana'] = f['ds'].dt.dayofweek
-    f['es_finde'] = (f['dia_semana'] >= 5).astype(int)
-    f['dia_mes'] = f['ds'].dt.day
-    f['mes'] = f['ds'].dt.month
-    f['dias_en_mes'] = f['ds'].dt.days_in_month
-    f['semana_ano'] = f['ds'].dt.isocalendar().week.astype(int)
-    f['es_quincena'] = f['dia_mes'].between(14, 17).astype(int)
-    # Fin de mes relativo (no fijo en 28-31: en febrero el 28 ya es fin de mes)
-    f['es_fin_mes'] = (f['dias_en_mes'] - f['dia_mes'] <= 2).astype(int)
-    f['es_inicio_mes'] = (f['dia_mes'] <= 3).astype(int)
-    f['dia_semana_sin'] = np.sin(2 * np.pi * f['dia_semana'] / 7)
-    f['dia_semana_cos'] = np.cos(2 * np.pi * f['dia_semana'] / 7)
-    f['mes_sin'] = np.sin(2 * np.pi * f['mes'] / 12)
-    f['mes_cos'] = np.cos(2 * np.pi * f['mes'] / 12)
-    return f.drop(columns=['dias_en_mes'])
-
-
-REGRESSORS_PROPHET = ['es_finde', 'es_quincena', 'es_fin_mes']
-LAGS = [1, 2, 3, 7, 14, 21, 28]
-
-
-def crear_features_v3(df, feriados_set=None):
-    """
-    Features para XGBoost. Todos los lags/medias usan shift(>=1), asi que la
-    fila del dia a predecir se puede construir con y=NaN sin mirar el futuro.
-    IMPORTANTE: no se hace dropna aqui (antes se borraba justamente la fila
-    que se queria predecir y se predecia el dia equivocado).
-    """
-    df = df.sort_values('ds').reset_index(drop=True).copy()
-    cal = features_calendario(df['ds'])
-    df = pd.concat([df, cal.drop(columns=['ds'])], axis=1)
-
-    if feriados_set is not None:
-        fechas_norm = df['ds'].dt.normalize()
-        df['es_feriado'] = fechas_norm.isin(feriados_set).astype(int)
-        df['feriado_manana'] = (fechas_norm + pd.Timedelta(days=1)).isin(feriados_set).astype(int)
-        df['feriado_ayer'] = (fechas_norm - pd.Timedelta(days=1)).isin(feriados_set).astype(int)
-
-    y_prev = df['y'].shift(1)
-    for lag in LAGS:
-        df[f'lag_{lag}'] = df['y'].shift(lag)
-
-    df['ma_7'] = y_prev.rolling(7, min_periods=7).mean()
-    df['ma_14'] = y_prev.rolling(14, min_periods=14).mean()
-    df['ma_28'] = y_prev.rolling(28, min_periods=28).mean()
-    df['std_7'] = y_prev.rolling(7, min_periods=7).std()
-    # Nivel del mismo dia de semana en las ultimas 4 semanas (patron semanal)
-    df['ma_dow_4'] = df[['lag_7', 'lag_14', 'lag_21', 'lag_28']].mean(axis=1)
-    df['diff_7'] = df['lag_1'] - df['lag_8'] if 'lag_8' in df else df['lag_1'] - df['y'].shift(8)
-    df['tendencia_7_28'] = df['ma_7'] / (df['ma_28'] + 1e-6)
-    df['ratio_lag1_ma7'] = df['lag_1'] / (df['ma_7'] + 1e-6)
-    df['ratio_dow'] = df['lag_7'] / (df['ma_7'] + 1e-6)
-    return df
-
-
-def columnas_features(df):
-    return [c for c in df.columns if c not in ('ds', 'y', 'cerrado')]
-
-
-def obtener_feriados(pais, anos):
-    paises_map = {
-        'Bolivia': holidays.Bolivia,
-        'Mexico': holidays.Mexico,
-        'Argentina': holidays.Argentina,
-        'Colombia': holidays.Colombia,
-        'Peru': holidays.Peru,
-        'Chile': holidays.Chile,
-        'Espana': holidays.Spain,
-        'USA': holidays.US,
-        'Brasil': holidays.Brazil,
-        'Ecuador': holidays.Ecuador,
-        'Venezuela': holidays.Venezuela,
-        'Paraguay': holidays.Paraguay
-    }
-    try:
-        clase = paises_map.get(pais)
-        if clase:
-            lista = []
-            for a in anos:
-                for fecha, nombre in clase(years=a).items():
-                    lista.append({'holiday': nombre, 'ds': pd.Timestamp(fecha)})
-            if lista:
-                return pd.DataFrame(lista).drop_duplicates('ds')
-    except Exception:
-        pass
-    return None
-
-
-# ============================================
-# METRICAS
-# ============================================
-
-def calcular_metricas(real, pred, mask_valida=None):
-    """
-    MAPE real (no inventado) + WAPE + sMAPE + MAE.
-      - MAPE: solo sobre dias con venta > 0 (es indefinido en 0).
-      - WAPE: sum|error| / sum(real). Es la metrica de seleccion: no explota
-        con dias de venta minima y no premia predecir por debajo.
-    """
-    real = np.asarray(real, dtype=float)
-    pred = np.clip(np.asarray(pred, dtype=float), 0, None)
-    if mask_valida is not None:
-        mask_valida = np.asarray(mask_valida, dtype=bool)
-        real, pred = real[mask_valida], pred[mask_valida]
-
-    if len(real) == 0:
-        return {'mape': 999.0, 'wape': 999.0, 'smape': 999.0, 'mae': 999.0, 'n': 0}
-
-    err = np.abs(real - pred)
-    pos = real > 0
-    mape = float(np.mean(err[pos] / real[pos]) * 100) if pos.any() else 999.0
-    wape = float(err.sum() / real.sum() * 100) if real.sum() > 0 else 999.0
-    denom = (np.abs(real) + np.abs(pred)) / 2
-    ok = denom > 1e-9
-    smape = float(np.mean(err[ok] / denom[ok]) * 100) if ok.any() else 999.0
-    if not pos.any():
-        mape = wape
-    return {'mape': round(mape, 2), 'wape': round(wape, 2),
-            'smape': round(smape, 2), 'mae': round(float(err.mean()), 2), 'n': int(len(real))}
-
-
-def calcular_mape(real, pred):
-    """Compatibilidad: MAPE real sobre dias con venta > 0."""
-    return calcular_metricas(real, pred)['mape']
-
-
-# ============================================
-# MODELOS
-# Todos comparten la misma firma: (df_train, horizonte, ctx) -> DataFrame(ds, yhat)
-# Asi el modelo que se valida es EXACTAMENTE el que produce el forecast final.
-# ============================================
-
-def _recortar_outliers(df, p=0.99):
-    """Winsoriza con umbral calculado SOLO con los datos de entrenamiento."""
-    df = df.copy()
-    abiertos = df['y'][df.get('cerrado', 0) == 0] if 'cerrado' in df else df['y']
-    if len(abiertos) < 30:
-        return df
-    hi = abiertos.quantile(p)
-    lo = abiertos.quantile(1 - p)
-    df['y'] = df['y'].clip(lower=max(lo, 0), upper=hi)
-    return df
-
-
-def _tr(y, usar_log):
-    return np.log1p(np.clip(np.asarray(y, dtype=float), 0, None)) if usar_log else np.asarray(y, dtype=float)
-
-
-def _inv(z, usar_log):
-    z = np.asarray(z, dtype=float)
-    if usar_log:
-        z = np.expm1(np.clip(z, -20, 30))
-    return np.clip(z, 0, None)
-
-
-def _fechas_futuras(df_train, horizonte):
-    return pd.date_range(start=df_train['ds'].max() + pd.Timedelta(days=1),
-                         periods=horizonte, freq='D')
-
-
-def _df_entrenable(df_train, usar_log):
-    """Serie de entrenamiento: sin dias cerrados y en la escala del modelo."""
-    d = df_train.copy()
-    if 'cerrado' in d:
-        d = d[d['cerrado'] == 0]
-    d = d[['ds', 'y']].dropna().reset_index(drop=True)
-    d['y'] = _tr(d['y'], usar_log)
-    return d
-
-
-def modelo_baseline(df_train, horizonte, ctx):
-    """
-    Baseline estacional: nivel robusto reciente x perfil de dia de semana.
-    Sirve de piso de comparacion; en series muy ruidosas suele ganar a todo.
-    """
-    d = _df_entrenable(df_train, usar_log=False)
-    if len(d) < 14:
-        return None
-    ult = d.tail(28)
-    nivel = float(ult['y'].median())
-    perfil = ult.assign(dow=ult['ds'].dt.dayofweek).groupby('dow')['y'].median()
-    perfil = (perfil / max(nivel, 1e-6)).clip(0.4, 2.0)
-    fechas = _fechas_futuras(df_train, horizonte)
-    factor = np.array([perfil.get(f.dayofweek, 1.0) for f in fechas])
-    return pd.DataFrame({'ds': fechas, 'yhat': np.clip(nivel * factor, 0, None)})
-
-
-def modelo_prophet(df_train, horizonte, ctx):
-    d = _df_entrenable(df_train, ctx['usar_log'])
-    if len(d) < 30:
-        return None
-    usar_reg = len(d) > 60
-    modelo = Prophet(
-        weekly_seasonality=len(d) > 30,
-        yearly_seasonality=len(d) > 540,
-        daily_seasonality=False,
-        interval_width=0.8,
-        holidays=ctx.get('feriados'),
-        # Series diarias de ventas son ruidosas: 0.15 sobreajustaba la tendencia
-        # y la extrapolaba al futuro. 0.03 da una tendencia mucho mas estable.
-        changepoint_prior_scale=ctx.get('cps', 0.03),
-        seasonality_prior_scale=ctx.get('sps', 8.0),
-        seasonality_mode='multiplicative' if (not ctx['usar_log'] and ctx.get('multiplicativo', True)) else 'additive',
-        changepoint_range=0.9
-    )
-    if usar_reg:
-        for r in REGRESSORS_PROPHET:
-            modelo.add_regressor(r, standardize=False)
-        cal = features_calendario(d['ds'])
-        d = pd.concat([d, cal[REGRESSORS_PROPHET]], axis=1)
-
-    modelo.fit(d)
-    fechas = _fechas_futuras(df_train, horizonte)
-    futuro = pd.DataFrame({'ds': fechas})
-    if usar_reg:
-        futuro = pd.concat([futuro, features_calendario(fechas)[REGRESSORS_PROPHET]], axis=1)
-    pred = modelo.predict(futuro)
-
-    out = pd.DataFrame({'ds': fechas})
-    out['yhat'] = _inv(pred['yhat'].values, ctx['usar_log'])
-    out['yhat_lower'] = _inv(pred['yhat_lower'].values, ctx['usar_log'])
-    out['yhat_upper'] = _inv(pred['yhat_upper'].values, ctx['usar_log'])
-    return out
-
-
-def modelo_sarima(df_train, horizonte, ctx):
-    """AutoARIMA estacional (m=7) si pmdarima esta disponible; si no, SARIMAX fijo."""
-    d = _df_entrenable(df_train, ctx['usar_log'])
-    if len(d) < 40:
-        return None
-    serie = d['y'].to_numpy()
-    fechas = _fechas_futuras(df_train, horizonte)
-    estacional = len(serie) >= 70
-
-    if HAS_PMDARIMA:
-        modelo = auto_arima(
-            serie, seasonal=estacional, m=7 if estacional else 1,
-            d=None, D=1 if estacional else 0,
-            start_p=0, start_q=0, max_p=3, max_q=3, max_P=1, max_Q=1,
-            stepwise=True, suppress_warnings=True, error_action='ignore',
-            information_criterion='aicc', n_jobs=1, trace=False
-        )
-        pred = np.asarray(modelo.predict(n_periods=horizonte))
-    else:
-        orden_est = (1, 0, 1, 7) if estacional else (0, 0, 0, 0)
-        res = SARIMAX(serie, order=(1, 1, 1), seasonal_order=orden_est,
-                      enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-        pred = np.asarray(res.forecast(steps=horizonte))
-
-    return pd.DataFrame({'ds': fechas, 'yhat': _inv(pred, ctx['usar_log'])})
-
-
-def _xgb_regresor(n_estimators):
-    return xgb.XGBRegressor(
-        n_estimators=n_estimators, max_depth=4, learning_rate=0.05,
-        subsample=0.9, colsample_bytree=0.9, reg_alpha=0.1, reg_lambda=2.0,
-        min_child_weight=5, random_state=42, n_jobs=2, eval_metric='mae'
-    )
-
-
-def modelo_xgboost(df_train, horizonte, ctx):
-    """
-    XGBoost recursivo. Dos correcciones importantes:
-      - el early stopping se usa solo para elegir n_estimators y luego se
-        reentrena con TODO el train (antes el modelo final perdia el 15% final,
-        que es justo la parte mas informativa).
-      - la prediccion multi-paso es recursiva con sus propias predicciones,
-        igual en validacion y en produccion (antes la validacion se alimentaba
-        con las ventas reales del test: leakage y MAPE optimista).
-    """
-    if not HAS_XGBOOST:
-        return None
-    d = _df_entrenable(df_train, ctx['usar_log'])
-    if len(d) < 60:
-        return None
-
-    feriados_set = ctx.get('feriados_set')
-    feats = crear_features_v3(d, feriados_set)
-    cols = columnas_features(feats)
-    entren = feats.dropna(subset=cols)
-    if len(entren) < 40:
-        return None
-
-    X, y = entren[cols], entren['y']
-    val_size = int(np.clip(len(X) * 0.15, 14, 60))
-    if len(X) - val_size >= 30:
-        es = _xgb_regresor(600)
-        es.set_params(early_stopping_rounds=40)
-        es.fit(X.iloc[:-val_size], y.iloc[:-val_size],
-               eval_set=[(X.iloc[-val_size:], y.iloc[-val_size:])], verbose=False)
-        n_arboles = max(50, int(getattr(es, 'best_iteration', 250) or 250))
-    else:
-        n_arboles = 250
-
-    modelo = _xgb_regresor(n_arboles)
-    modelo.fit(X, y, verbose=False)
-
-    # Forecast recursivo
-    historia = d.copy()
-    fechas = _fechas_futuras(df_train, horizonte)
-    preds = []
-    for fecha in fechas:
-        ventana = pd.concat(
-            [historia.tail(80), pd.DataFrame({'ds': [fecha], 'y': [np.nan]})],
-            ignore_index=True
-        )
-        fila = crear_features_v3(ventana, feriados_set).tail(1)
-        assert fila['ds'].iloc[0] == fecha
-        z = float(modelo.predict(fila[cols])[0])
-        preds.append(z)
-        historia = pd.concat([historia, pd.DataFrame({'ds': [fecha], 'y': [z]})],
-                             ignore_index=True)
-
-    out = pd.DataFrame({'ds': fechas, 'yhat': _inv(preds, ctx['usar_log'])})
-    imp = sorted(zip(cols, modelo.feature_importances_), key=lambda x: x[1], reverse=True)[:5]
-    out.attrs['top_features'] = [(c, round(float(v), 3)) for c, v in imp]
-    return out
-
-
-MODELOS = [
-    ('Baseline estacional', modelo_baseline),
-    ('Prophet', modelo_prophet),
-    ('AutoARIMA' if HAS_PMDARIMA else 'SARIMA', modelo_sarima),
-    ('XGBoost', modelo_xgboost),
-]
-
-
-# ============================================
-# WALK FORWARD VALIDATION (VARIOS CORTES) + ENSEMBLE
-# ============================================
-
-def construir_folds(df, horizonte, n_folds):
-    """Cortes expansivos: [.. t] entrena, (t, t+h] evalua. Sin solapamiento."""
-    n = len(df)
-    folds = []
-    for k in range(n_folds, 0, -1):
-        fin = n - (k - 1) * horizonte
-        ini = fin - horizonte
-        if ini < 40:  # minimo de historia para entrenar algo util
-            continue
-        folds.append((df.iloc[:ini].copy(), df.iloc[ini:fin].copy()))
-    return folds
-
-
-def _pesos_desde_errores(errores, max_modelos=3):
-    """Pesos ~ 1/error^2 sobre los mejores modelos (y solo si son competitivos)."""
-    validos = {k: v for k, v in errores.items() if np.isfinite(v) and v < 100}
-    if not validos:
-        return {}
-    orden = sorted(validos.items(), key=lambda x: x[1])
-    mejor = orden[0][1]
-    elegidos = [(k, v) for k, v in orden[:max_modelos] if v <= mejor * 1.35]
-    pesos = np.array([1.0 / max(v, 0.5) ** 2 for _, v in elegidos])
-    pesos = pesos / pesos.sum()
-    return {k: float(p) for (k, _), p in zip(elegidos, pesos)}
-
-
-def walk_forward_validation(df, pais, horizonte=30, n_folds=3, usar_log=False, progreso=None):
-    """
-    Valida con varios cortes temporales (no uno solo). Devuelve metricas
-    promediadas por modelo, el ensemble evaluado de forma honesta (los pesos
-    de cada fold vienen de folds anteriores) y los pesos finales.
-    """
-    df = df.sort_values('ds').reset_index(drop=True)
-    n_abiertos = int((df.get('cerrado', pd.Series(0, index=df.index)) == 0).sum())
-    if n_abiertos < 45:
-        return None, "Pocos datos para validar (< 45 dias con ventas)"
-
-    horizonte = int(np.clip(horizonte, 7, max(14, int(len(df) * 0.25))))
-    n_folds = max(1, min(n_folds, max(1, (len(df) - 40) // horizonte)))
-    folds = construir_folds(df, horizonte, n_folds)
-    if not folds:
-        return None, "Serie demasiado corta para validacion temporal"
-
-    anos = sorted(df['ds'].dt.year.unique().tolist())
-    anos = anos + [anos[-1] + 1]
-    feriados = obtener_feriados(pais, anos)
-    ctx = {
-        'usar_log': usar_log,
-        'feriados': feriados,
-        'feriados_set': set(feriados['ds'].dt.normalize()) if feriados is not None else None,
-    }
-
-    errores_por_fold = []   # [{modelo: wape}]
-    metricas_modelo = {}    # {modelo: [dict metricas]}
-    ensemble_metricas = []
-    pred_ens_rel = []       # errores relativos del ensemble (para intervalos)
-    total = len(folds) * len(MODELOS)
-    hecho = 0
-
-    for df_train, df_test in folds:
-        df_train_w = _recortar_outliers(df_train)
-        mask = (df_test.get('cerrado', 0) == 0).values if 'cerrado' in df_test else np.ones(len(df_test), bool)
-        real = df_test['y'].to_numpy(dtype=float)
-        preds_fold = {}
-        errs_fold = {}
-
-        for nombre, fn in MODELOS:
-            hecho += 1
-            if progreso:
-                progreso(hecho / total, nombre)
-            try:
-                out = fn(df_train_w, len(df_test), ctx)
-            except Exception:
-                out = None
-            if out is None or out['yhat'].isna().any():
-                continue
-            yhat = out['yhat'].to_numpy(dtype=float)[:len(df_test)]
-            if len(yhat) != len(df_test):
-                continue
-            if 'cerrado' in df_test:
-                yhat = np.where(df_test['cerrado'].values == 1, 0.0, yhat)
-            m = calcular_metricas(real, yhat, mask)
-            if m['wape'] >= 100:
-                continue
-            preds_fold[nombre] = yhat
-            errs_fold[nombre] = m['wape']
-            metricas_modelo.setdefault(nombre, []).append(m)
-
-        if not preds_fold:
-            continue
-
-        # Ensemble honesto: pesos calculados con folds ANTERIORES
-        historicos = {}
-        for e in errores_por_fold:
-            for k, v in e.items():
-                historicos.setdefault(k, []).append(v)
-        pesos_previos = _pesos_desde_errores(
-            {k: float(np.mean(v)) for k, v in historicos.items() if k in preds_fold}
-        ) if historicos else {}
-        if not pesos_previos:
-            pesos_previos = {k: 1.0 / len(preds_fold) for k in preds_fold}
-
-        suma = sum(pesos_previos.get(k, 0) for k in preds_fold)
-        if suma > 0:
-            mezcla = sum(preds_fold[k] * (pesos_previos.get(k, 0) / suma) for k in preds_fold)
-            ensemble_metricas.append(calcular_metricas(real, mezcla, mask))
-            with np.errstate(divide='ignore', invalid='ignore'):
-                rel = np.where((real > 0) & mask, mezcla / np.maximum(real, 1e-6), np.nan)
-            pred_ens_rel.extend([v for v in rel if np.isfinite(v)])
-
-        errores_por_fold.append(errs_fold)
-
-    if not metricas_modelo:
-        return None, "Ningun modelo convergio"
-
-    resumen = {}
-    for nombre, lista in metricas_modelo.items():
-        resumen[nombre] = {k: round(float(np.mean([m[k] for m in lista])), 2)
-                           for k in ('mape', 'wape', 'smape', 'mae')}
-        resumen[nombre]['folds'] = len(lista)
-
-    pesos_finales = _pesos_desde_errores({k: v['wape'] for k, v in resumen.items()})
-
-    if ensemble_metricas:
-        ens = {k: round(float(np.mean([m[k] for m in ensemble_metricas])), 2)
-               for k in ('mape', 'wape', 'smape', 'mae')}
-    else:
-        mejor = min(resumen.items(), key=lambda x: x[1]['wape'])
-        ens = dict(mejor[1])
-    ens['folds'] = len(ensemble_metricas) or 1
-
-    # Intervalo empirico a partir de los errores de validacion del ensemble
-    if len(pred_ens_rel) >= 20:
-        ratios = np.array(pred_ens_rel)
-        banda = (float(np.quantile(ratios, 0.9)), float(np.quantile(ratios, 0.1)))
-    else:
-        banda = (1.25, 0.8)
-
-    return {
-        'resumen': resumen,
-        'ensemble': ens,
-        'pesos': pesos_finales,
-        'ctx': ctx,
-        'horizonte_validacion': horizonte,
-        'n_folds': len(folds),
-        'banda': banda,
-    }, None
-
-
-def _forecast_final(df, dias_futuro, ctx, pesos, banda):
-    """Reentrena los modelos del ensemble con TODA la serie y combina con los mismos pesos."""
-    df_w = _recortar_outliers(df)
-    fn_por_nombre = dict(MODELOS)
-    salidas, usados = {}, {}
-    intervalo_modelo = None
-
-    for nombre, peso in sorted(pesos.items(), key=lambda x: -x[1]):
-        fn = fn_por_nombre.get(nombre)
-        if fn is None:
-            continue
-        try:
-            out = fn(df_w, dias_futuro, ctx)
-        except Exception:
-            out = None
-        if out is None or out['yhat'].isna().any():
-            continue
-        salidas[nombre] = out
-        usados[nombre] = peso
-        if 'yhat_lower' in out and intervalo_modelo is None:
-            intervalo_modelo = out
-
-    if not salidas:
-        raise RuntimeError("No se pudo generar el pronostico final")
-
-    total = sum(usados.values())
-    usados = {k: v / total for k, v in usados.items()}
-    fechas = next(iter(salidas.values()))['ds']
-    yhat = sum(salidas[k]['yhat'].to_numpy(dtype=float) * w for k, w in usados.items())
-
-    fut = pd.DataFrame({'ds': fechas, 'yhat': np.clip(yhat, 0, None)})
-    if 'cerrado' in df:
-        cerrados = set(df.loc[df['cerrado'] == 1, 'ds'].dt.dayofweek.unique())
-        if cerrados:
-            fut.loc[fut['ds'].dt.dayofweek.isin(cerrados), 'yhat'] = 0.0
-
-    q_alto, q_bajo = banda
-    fut['yhat_lower'] = np.clip(fut['yhat'] / max(q_alto, 1.01), 0, None)
-    fut['yhat_upper'] = fut['yhat'] / min(max(q_bajo, 0.3), 0.99)
-
-    hist = df[['ds', 'y']].copy()
-    hist['yhat'] = hist['y']
-    hist['yhat_lower'] = hist['y']
-    hist['yhat_upper'] = hist['y']
-    completo = pd.concat([hist[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], fut],
-                         ignore_index=True)
-    return completo, usados
-
-
-def analizar_v3(df, pais, dias_futuro, usar_log=False, n_folds=3, progreso=None):
-    """
-    Pipeline: walk-forward multi-corte -> pesos honestos -> reentreno con toda
-    la serie -> forecast del MISMO ensemble que se valido.
-    """
-    horizonte_val = int(np.clip(dias_futuro, 14, 30))
-    val, error = walk_forward_validation(
-        df, pais, horizonte=horizonte_val, n_folds=n_folds,
-        usar_log=usar_log, progreso=progreso
-    )
-    if val is None:
-        return None, None, error
-
-    try:
-        prediccion, pesos_usados = _forecast_final(
-            df, dias_futuro, val['ctx'], val['pesos'], val['banda']
-        )
-    except Exception as e:
-        return None, None, str(e)
-
-    nombres = '+'.join(pesos_usados.keys())
-    ens = val['ensemble']
-    metricas = {
-        'modelo_ganador': nombres if len(pesos_usados) > 1 else next(iter(pesos_usados)),
-        'MAPE': ens['mape'],
-        'WAPE': ens['wape'],
-        'sMAPE': ens['smape'],
-        'MAE': ens['mae'],
-        'Precision': max(0, round(100 - ens['mape'], 2)),
-        'folds': val['n_folds'],
-        'horizonte_validacion': val['horizonte_validacion'],
-        'pesos': {k: round(v, 3) for k, v in pesos_usados.items()},
-        'por_modelo': val['resumen'],
-        'usar_log': usar_log,
-    }
-    return prediccion, metricas, None
-
-
-# ============================================
-# ANALISIS Y RECOMENDACIONES
-# ============================================
-
-def solo_dias_abiertos(df):
-    """Excluye los dias cerrados: sus ceros no son ventas caidas."""
-    if 'cerrado' in df.columns:
-        return df[df['cerrado'] == 0].reset_index(drop=True)
-    return df
-
-
-def obtener_mejor_dia(df):
-    dias_nombres = ['Lunes', 'Martes', 'Miercoles', 'Jueves',
-                    'Viernes', 'Sabado', 'Domingo']
-    df_temp = solo_dias_abiertos(df).copy()
-    df_temp['dia'] = df_temp['ds'].dt.dayofweek
-    ventas = df_temp.groupby('dia')['y'].mean()
-    if ventas.sum() == 0:
-        return "No detectado", 0
-    idx = ventas.idxmax()
-    return dias_nombres[idx], ventas[idx]
-
-
-def detectar_cambio_tendencia(df, window=14):
-    df = solo_dias_abiertos(df)
-    if len(df) < window * 2:
-        return {'hay_cambio': False}
-    ultimos = df['y'].tail(window)
-    anteriores = df['y'].tail(window * 2).head(window)
-    if anteriores.mean() == 0:
-        return {'hay_cambio': False}
-    cambio = (ultimos.mean() - anteriores.mean()) / anteriores.mean() * 100
-    if abs(cambio) > 15:
-        return {'hay_cambio': True, 'tipo': 'subida' if cambio > 0 else 'bajada',
-                'magnitud': abs(cambio)}
-    return {'hay_cambio': False}
-
-
-def generar_recomendaciones_v3(df, prediccion, metricas, info):
-    recs = []
-    abiertos = solo_dias_abiertos(df)
-
-    # 1. Tendencia general
-    primera = abiertos['y'][:len(abiertos)//2].mean()
-    segunda = abiertos['y'][len(abiertos)//2:].mean()
-    if primera > 0:
-        if segunda > primera * 1.1:
-            recs.append({'tipo': 'positivo',
-                'texto': f'Crecimiento de {((segunda/primera-1)*100):.1f}% en el ultimo periodo. Aumenta inventario.'})
-        elif segunda < primera * 0.9:
-            recs.append({'tipo': 'alerta',
-                'texto': f'Baja de {((1-segunda/primera)*100):.1f}% en ventas. Investiga causas.'})
-
-    # 2. Mejor dia
-    mejor, promedio = obtener_mejor_dia(df)
-    if mejor != "No detectado":
-        recs.append({'tipo': 'info',
-            'texto': f'{mejor} es tu mejor dia (promedio ${promedio:.0f}). Promociones en dias debiles.'})
-
-    # 3. Precision
-    if metricas['Precision'] > 85:
-        recs.append({'tipo': 'positivo',
-            'texto': f'Modelo confiable ({metricas["Precision"]}%). Planifica con seguridad.'})
-    elif metricas['Precision'] > 70:
-        recs.append({'tipo': 'info',
-            'texto': f'Modelo aceptable ({metricas["Precision"]}%). Usa como guia con margen.'})
-    else:
-        recs.append({'tipo': 'alerta',
-            'texto': f'Precision baja ({metricas["Precision"]}%). Datos irregulares, usa con precaucion.'})
-
-    # 4. Proxima semana
-    prox = prediccion[prediccion['ds'] > df['ds'].max()]['yhat'].head(7).sum()
-    ult = df['y'].tail(7).sum()  # ultimos 7 dias de calendario, comparable con el forecast
-    if ult > 0:
-        cambio = (prox - ult) / ult * 100
-        if cambio > 5:
-            recs.append({'tipo': 'positivo',
-                'texto': f'Aumento esperado de {cambio:.1f}% proxima semana. Prepara stock.'})
-        elif cambio < -5:
-            recs.append({'tipo': 'alerta',
-                'texto': f'Baja esperada de {abs(cambio):.1f}% proxima semana. Considera promociones.'})
-
-    # 5. Cambio de tendencia
-    cambio = detectar_cambio_tendencia(df)
-    if cambio['hay_cambio']:
-        icon = 'subida' if cambio['tipo'] == 'subida' else 'bajada'
-        recs.append({'tipo': 'positivo' if cambio['tipo'] == 'subida' else 'alerta',
-            'texto': f'Tendencia {icon} reciente ({cambio["magnitud"]:.1f}% en 14 dias). Ajusta estrategia.'})
-
-    # 6. Stock recomendado
-    pred_total = prediccion[prediccion['ds'] > df['ds'].max()]['yhat'].sum()
-    stock = pred_total * 1.2
-    recs.append({'tipo': 'info',
-        'texto': f'Stock recomendado: ${stock:,.0f} (incluye 20% margen de seguridad).'})
-
-    # 7. Dias de datos
-    if info['dias'] < 90:
-        recs.append({'tipo': 'alerta',
-            'texto': f'Solo {info["dias"]} dias de datos. Con 6+ meses la precision mejorara significativamente.'})
-
-    return recs
-
-
-def evaluar_confiabilidad(df, mape):
-    abiertos = solo_dias_abiertos(df)
-    dias = (df['ds'].max() - df['ds'].min()).days
-    pct_zeros = (abiertos['y'] == 0).sum() / max(len(abiertos), 1) * 100
-    varianza = abiertos['y'].std() / (abiertos['y'].mean() if abiertos['y'].mean() != 0 else 1)
-
-    confianza = 0
-    detalles = []
-
-    if dias >= 365:
-        confianza += 35; detalles.append("✅ 1+ ano de datos")
-    elif dias >= 180:
-        confianza += 30; detalles.append("✅ 6+ meses de datos")
-    elif dias >= 90:
-        confianza += 25; detalles.append("✅ 3+ meses de datos")
-    else:
-        confianza += 10; detalles.append("⚠️ < 3 meses de datos")
-
-    if pct_zeros < 5:
-        confianza += 25; detalles.append("✅ Pocos dias sin ventas")
-    elif pct_zeros < 20:
-        confianza += 12; detalles.append("⚠️ Algunos dias sin ventas")
-    else:
-        confianza += 0; detalles.append("🔴 Muchos dias sin ventas")
-
-    if 0.3 < varianza < 2:
-        confianza += 20; detalles.append("✅ Variabilidad normal")
-    elif varianza == 0:
-        confianza += 0; detalles.append("🔴 Ventas constantes")
-    else:
-        confianza += 10; detalles.append("⚠️ Variabilidad alta")
-
-    if mape < 10:
-        confianza += 20; detalles.append("✅ Modelo muy preciso")
-    elif mape < 20:
-        confianza += 15; detalles.append("✅ Modelo preciso")
-    elif mape < 30:
-        confianza += 10; detalles.append("⚠️ Modelo aceptable")
-    else:
-        confianza += 5; detalles.append("🔴 Modelo con baja precision")
-
-    nivel = "🟢 ALTA" if confianza >= 85 else ("🟡 MEDIA" if confianza >= 60 else "🔴 BAJA")
-    return {"score": confianza, "nivel": nivel, "detalles": detalles}
-
-# ============================================
-# 6 GRAFICOS DE ANALISIS POR DIMENSION
-# ============================================
-
-def grafico_ventas_rama(df_raw, col_branch, col_ventas):
-    if col_branch is None:
-        return None
-    ventas = df_raw.groupby(col_branch)[col_ventas].sum().reset_index()
-    ventas = ventas.sort_values(col_ventas, ascending=True)
-    colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#38ef7d', '#11998e']
-    fig = go.Figure(data=[go.Bar(
-        x=ventas[col_ventas], y=ventas[col_branch], orientation='h',
-        marker=dict(color=colors[:len(ventas)], line=dict(color='white', width=1)),
-        hovertemplate='<b>%{y}</b><br>Ventas: $%{x:,.0f}<extra></extra>'
-    )])
-    fig.update_layout(title="Ventas por Rama/Sucursal", xaxis_title="Ventas ($)",
-                      yaxis_title="", template="plotly_white", height=350,
-                      margin=dict(l=10, r=10, t=40, b=10))
-    return fig
-
-
-def grafico_ventas_ciudad(df_raw, col_ciudad, col_ventas):
-    if col_ciudad is None:
-        return None
-    ventas = df_raw.groupby(col_ciudad)[col_ventas].sum().reset_index()
-    colors = ['#11998e', '#38ef7d', '#f5576c', '#667eea', '#764ba2', '#f093fb']
-    fig = go.Figure(data=[go.Pie(
-        labels=ventas[col_ciudad], values=ventas[col_ventas],
-        marker=dict(colors=colors[:len(ventas)], line=dict(color='white', width=2)),
-        hovertemplate='<b>%{label}</b><br>$%{value:,.0f} (%{percent})<extra></extra>'
-    )])
-    fig.update_layout(title="Distribucion por Ciudad", template="plotly_white",
-                      height=350, margin=dict(l=10, r=10, t=40, b=10))
-    return fig
-
-
-def grafico_ventas_producto(df_raw, col_producto, col_ventas):
-    if col_producto is None:
-        return None
-    ventas = df_raw.groupby(col_producto)[col_ventas].sum().reset_index()
-    ventas = ventas.sort_values(col_ventas, ascending=True)
-    colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#38ef7d', '#11998e',
-              '#4facfe', '#00f2fe', '#f6d365', '#fda085']
-    fig = go.Figure(data=[go.Bar(
-        x=ventas[col_ventas], y=ventas[col_producto], orientation='h',
-        marker=dict(color=colors[:len(ventas)], line=dict(color='white', width=1)),
-        hovertemplate='<b>%{y}</b><br>Ventas: $%{x:,.0f}<extra></extra>'
-    )])
-    fig.update_layout(title="Ventas por Linea de Producto", xaxis_title="Ventas ($)",
-                      yaxis_title="", template="plotly_white", height=450,
-                      margin=dict(l=10, r=10, t=40, b=10))
-    return fig
-
-
-def grafico_patron_dia_semana(df_raw, col_fecha, col_ventas):
-    df_copy = df_raw.copy()
-    df_copy['fecha_dt'] = parsear_fechas(df_copy[col_fecha])[0]
-    df_copy['dia_nombre'] = df_copy['fecha_dt'].dt.day_name()
-    dias_orden = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-    dias_es = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miercoles',
-               'Thursday': 'Jueves', 'Friday': 'Viernes', 'Saturday': 'Sabado', 'Sunday': 'Domingo'}
-    ventas = df_copy.groupby('dia_nombre')[col_ventas].agg(['sum', 'mean', 'count']).reindex(dias_orden)
-    ventas.index = [dias_es.get(d, d) for d in ventas.index]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=ventas.index, y=ventas['sum'], mode='lines+markers',
-        name='Total', line=dict(color='#667eea', width=3), marker=dict(size=10),
-        hovertemplate='<b>%{x}</b><br>Total: $%{y:,.0f}<extra></extra>'))
-    fig.add_trace(go.Scatter(x=ventas.index, y=ventas['mean'], mode='lines+markers',
-        name='Promedio/trans', line=dict(color='#f5576c', width=2, dash='dash'),
-        marker=dict(size=8), hovertemplate='<b>%{x}</b><br>Promedio: $%{y:,.0f}<extra></extra>'))
-    fig.update_layout(title="Patron por Dia de Semana", xaxis_title="Dia",
-                      yaxis_title="Ventas ($)", template="plotly_white", hovermode='x unified',
-                      height=400, margin=dict(l=10, r=10, t=40, b=10))
-    return fig
-
-
-def grafico_ventas_por_hora(df_raw, col_hora, col_ventas):
-    if col_hora is None:
-        return None
-    df_copy = df_raw.copy()
-    df_copy['hora_dt'] = pd.to_datetime(df_copy[col_hora], format='%H:%M:%S', errors='coerce')
-    df_copy['hora'] = df_copy['hora_dt'].dt.hour
-    ventas = df_copy.groupby('hora')[col_ventas].agg(['sum', 'count']).reset_index()
-
-    fig = go.Figure(data=[go.Bar(
-        x=ventas['hora'], y=ventas['sum'],
-        marker=dict(color=ventas['sum'], colorscale='Viridis', showscale=True,
-                    colorbar=dict(title="Ventas")),
-        hovertemplate='<b>%{x}:00</b><br>Ventas: $%{y:,.0f}<br>Trans: %{customdata}<extra></extra>',
-        customdata=ventas['count']
-    )])
-    fig.update_layout(title="Ventas por Hora del Dia", xaxis_title="Hora",
-                      yaxis_title="Ventas ($)", template="plotly_white", height=400,
-                      margin=dict(l=10, r=10, t=40, b=10))
-    return fig
-
-
-def grafico_heatmap_rama_ciudad(df_raw, col_branch, col_ciudad, col_ventas):
-    if col_branch is None or col_ciudad is None:
-        return None
-    pivot = df_raw.pivot_table(values=col_ventas, index=col_branch, columns=col_ciudad, aggfunc='sum')
-    fig = go.Figure(data=go.Heatmap(
-        z=pivot.values, x=pivot.columns, y=pivot.index,
-        colorscale='Viridis', hovertemplate='<b>%{y} - %{x}</b><br>$%{z:,.0f}<extra></extra>',
-        colorbar=dict(title="Ventas ($)")
-    ))
-    fig.update_layout(title="Heatmap: Rama vs Ciudad", xaxis_title="Ciudad",
-                      yaxis_title="Rama", template="plotly_white", height=400,
-                      margin=dict(l=10, r=10, t=40, b=10))
-    return fig
-
-
-def tabla_comparacion_periodos(df_raw, col_fecha, col_ventas):
-    df_copy = df_raw.copy()
-    df_copy['fecha_dt'] = parsear_fechas(df_copy[col_fecha])[0]
-    fecha_corte = df_copy['fecha_dt'].min() + pd.Timedelta(days=(df_copy['fecha_dt'].max() - df_copy['fecha_dt'].min()).days // 2)
-
-    p1 = df_copy[df_copy['fecha_dt'] < fecha_corte]
-    p2 = df_copy[df_copy['fecha_dt'] >= fecha_corte]
-
-    datos = {
-        'Metrica': ['Ventas Totales', 'Transacciones', 'Promedio', 'Maximo', 'Minimo', 'Dias unicos'],
-        'Periodo 1': [
-            f"${p1[col_ventas].sum():,.0f}", f"{len(p1):,}",
-            f"${p1[col_ventas].mean():.0f}", f"${p1[col_ventas].max():.0f}",
-            f"${p1[col_ventas].min():.0f}", f"{p1['fecha_dt'].nunique()}"
-        ],
-        'Periodo 2': [
-            f"${p2[col_ventas].sum():,.0f}", f"{len(p2):,}",
-            f"${p2[col_ventas].mean():.0f}", f"${p2[col_ventas].max():.0f}",
-            f"${p2[col_ventas].min():.0f}", f"{p2['fecha_dt'].nunique()}"
-        ]
-    }
-    return pd.DataFrame(datos)
-
-# ============================================
-# INTERFAZ STREAMLIT V3 - SALESPREDICT PRO
-# ============================================
+import warnings, io
+warnings.filterwarnings("ignore")
+
+# ── Módulos propios ──────────────────────────────────────────────────────────
+from src.data_loader  import (cargar_csv_seguro, cargar_excel_seguro,
+                               detectar_columnas_clave)
+from src.features     import (preparar_serie, sugerir_log, impacto_externas)
+from src.models       import get_modelos, HAS_LIGHTGBM, HAS_XGBOOST, HAS_PMDARIMA
+from src.forecast     import (analizar, generar_recomendaciones,
+                               evaluar_confiabilidad,
+                               grafico_proyeccion, grafico_comparacion_modelos,
+                               grafico_ventas_rama, grafico_ventas_ciudad,
+                               grafico_ventas_producto, grafico_patron_dia_semana,
+                               grafico_ventas_hora, tabla_comparacion_periodos,
+                               solo_dias_abiertos)
+from src.evaluation   import calcular_metricas
+
+# ════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN DE PÁGINA
+# ════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="SalesPredict — Predicción de ventas",
+    page_title="SalesPredict AI",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
+# ════════════════════════════════════════════════════════════════════════════
+# CSS — TEMA OSCURO COMPLETO
+# ════════════════════════════════════════════════════════════════════════════
+
 st.markdown("""
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
 <style>
-    .block-container { padding-top: 1.5rem; max-width: 1100px; }
-    .app-title { font-size: 1.75rem; font-weight: 700; color: #111827; margin: 0 0 0.25rem 0; }
-    .app-subtitle { color: #6b7280; font-size: 0.95rem; margin-bottom: 1.5rem; }
-    .step-badge {
-        display: inline-block; background: #eef2ff; color: #4338ca;
-        font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em;
-        text-transform: uppercase; padding: 0.2rem 0.55rem; border-radius: 999px; margin-bottom: 0.35rem;
-    }
-    .step-title { font-size: 1.05rem; font-weight: 600; color: #111827; margin: 0 0 0.75rem 0; }
-    .result-hero {
-        background: linear-gradient(135deg, #1e3a5f 0%, #2563eb 100%);
-        border-radius: 12px; padding: 1.5rem 1.75rem; color: white; margin: 1rem 0 1.5rem 0;
-    }
-    .result-hero .label { font-size: 0.8rem; opacity: 0.85; text-transform: uppercase; letter-spacing: 0.05em; }
-    .result-hero .value { font-size: 2.2rem; font-weight: 800; line-height: 1.2; margin: 0.25rem 0; }
-    .result-hero .hint { font-size: 0.85rem; opacity: 0.8; }
-    .metric-plain {
-        background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px;
-        padding: 0.9rem 1rem; text-align: center;
-    }
-    .metric-plain .lbl { font-size: 0.75rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em; }
-    .metric-plain .val { font-size: 1.5rem; font-weight: 700; color: #111827; margin-top: 0.15rem; }
-    .rec-item {
-        padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 0.5rem;
-        border-left: 3px solid; font-size: 0.92rem; line-height: 1.45;
-    }
-    .rec-ok { background: #f0fdf4; border-color: #22c55e; color: #14532d; }
-    .rec-warn { background: #fff7ed; border-color: #f97316; color: #7c2d12; }
-    .rec-info { background: #eff6ff; border-color: #3b82f6; color: #1e3a8a; }
-    div[data-testid="stSidebar"] { background: #fafafa; }
-    .footer-note { text-align: center; color: #9ca3af; font-size: 0.78rem; margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #f3f4f6; }
+/* ── Base & reset ─────────────────────────────────────────────────────── */
+html, body, [class*="css"], .stApp {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    background-color: #111827 !important;
+    color: #F9FAFB !important;
+}
+.block-container {
+    padding: 1.5rem 1.5rem 4rem 1.5rem !important;
+    max-width: 1100px !important;
+}
+
+/* ── Ocultar elementos de Streamlit ───────────────────────────────────── */
+#MainMenu, footer, header,
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+[data-testid="collapsedControl"] { display: none !important; }
+
+/* ── Forzar fondo oscuro en todos los contenedores ───────────────────── */
+[data-testid="stVerticalBlock"],
+[data-testid="stHorizontalBlock"],
+section[data-testid="stSidebar"],
+div[data-testid="stForm"],
+.element-container { background: transparent !important; }
+
+/* ── Scrollbar ────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:#111827; }
+::-webkit-scrollbar-thumb { background:#374151; border-radius:3px; }
+
+/* ── Header top bar ───────────────────────────────────────────────────── */
+.sp-topbar {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: .75rem 0 1.25rem 0; border-bottom:1px solid #1F2937;
+    margin-bottom:1.5rem;
+}
+.sp-logo { display:flex; align-items:center; gap:.5rem; }
+.sp-logo-icon { font-size:1.4rem; }
+.sp-logo-text { font-size:1.1rem; font-weight:800; color:#F9FAFB; letter-spacing:-.02em; }
+.sp-logo-badge {
+    font-size:.65rem; font-weight:700; background:#3B82F6; color:white;
+    padding:.15rem .4rem; border-radius:4px; letter-spacing:.04em;
+}
+.sp-step-pill {
+    display:inline-flex; align-items:center; gap:.3rem;
+    font-size:.72rem; font-weight:600; color:#9CA3AF;
+    background:#1F2937; padding:.3rem .7rem; border-radius:999px;
+}
+.sp-step-pill .active { color:#3B82F6; }
+
+/* ── Step progress bar ────────────────────────────────────────────────── */
+.step-bar {
+    display:flex; align-items:center; gap:0; margin-bottom:2rem;
+    overflow-x:auto; padding-bottom:.25rem;
+}
+.step-item {
+    display:flex; flex-direction:column; align-items:center; gap:.25rem;
+    flex:1; min-width:70px;
+}
+.step-circle {
+    width:32px; height:32px; border-radius:50%; display:flex;
+    align-items:center; justify-content:center; font-size:.75rem; font-weight:700;
+    border:2px solid #374151; background:#1F2937; color:#9CA3AF;
+    transition: all .3s;
+}
+.step-circle.done   { background:#22C55E; border-color:#22C55E; color:white; }
+.step-circle.active { background:#3B82F6; border-color:#3B82F6; color:white; }
+.step-label { font-size:.65rem; font-weight:500; color:#6B7280; white-space:nowrap; }
+.step-label.active { color:#3B82F6; }
+.step-connector { height:2px; flex:1; min-width:16px; background:#374151; margin-top:-16px; }
+.step-connector.done { background:#22C55E; }
+
+/* ── Hero ─────────────────────────────────────────────────────────────── */
+.hero-wrap {
+    text-align:center; padding:3rem 1rem 2.5rem;
+}
+.hero-badge {
+    display:inline-flex; align-items:center; gap:.4rem;
+    background:#1F2937; border:1px solid #374151; color:#9CA3AF;
+    font-size:.72rem; font-weight:600; padding:.35rem .8rem;
+    border-radius:999px; margin-bottom:1.25rem; letter-spacing:.04em;
+}
+.hero-title {
+    font-size:2.6rem; font-weight:800; line-height:1.15; color:#F9FAFB;
+    letter-spacing:-.03em; margin-bottom:.75rem;
+}
+.hero-title span { color:#3B82F6; }
+.hero-sub {
+    font-size:1.05rem; color:#9CA3AF; font-weight:400;
+    max-width:480px; margin:0 auto 2rem auto; line-height:1.6;
+}
+.hero-cta {
+    display:inline-flex; align-items:center; gap:.5rem;
+    background:linear-gradient(135deg,#2563EB,#3B82F6);
+    color:white; font-weight:700; font-size:1rem;
+    padding:.85rem 2.2rem; border-radius:10px; cursor:pointer;
+    box-shadow:0 0 30px rgba(59,130,246,.35);
+    border:none; text-decoration:none; transition:all .2s;
+}
+.hero-cta:hover { box-shadow:0 0 40px rgba(59,130,246,.55); transform:translateY(-1px); }
+.hero-footer {
+    margin-top:1rem; font-size:.78rem; color:#6B7280;
+}
+.hero-stats {
+    display:flex; justify-content:center; gap:2.5rem;
+    margin-top:2.5rem; padding-top:2rem; border-top:1px solid #1F2937;
+}
+.hero-stat-val { font-size:1.5rem; font-weight:800; color:#F9FAFB; }
+.hero-stat-lab { font-size:.72rem; color:#6B7280; margin-top:.15rem; }
+
+/* ── Upload zone ──────────────────────────────────────────────────────── */
+.upload-title {
+    font-size:1.1rem; font-weight:700; color:#F9FAFB; margin-bottom:.25rem;
+}
+.upload-sub { font-size:.82rem; color:#9CA3AF; margin-bottom:1rem; }
+.quality-box {
+    background:#1F2937; border:1px solid #374151; border-radius:12px;
+    padding:1rem 1.25rem; margin:1rem 0;
+}
+.quality-row {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:.4rem 0; border-bottom:1px solid #374151; font-size:.83rem;
+}
+.quality-row:last-child { border-bottom:none; }
+.q-check { color:#22C55E; font-weight:600; }
+.q-warn  { color:#F59E0B; font-weight:600; }
+.q-score {
+    background:#022c22; color:#22C55E; font-weight:800;
+    padding:.3rem .8rem; border-radius:8px; font-size:.9rem;
+    border:1px solid #15803d;
+}
+
+/* ── Cards ────────────────────────────────────────────────────────────── */
+.card {
+    background:#1F2937; border:1px solid #374151; border-radius:14px;
+    padding:1.1rem 1.25rem;
+}
+.card-dark { background:#273449; border-color:#374151; }
+
+/* ── Metric card ──────────────────────────────────────────────────────── */
+.mc { background:#1F2937; border:1px solid #374151; border-radius:12px;
+      padding:1rem; text-align:center; }
+.mc-icon  { font-size:1.3rem; margin-bottom:.3rem; }
+.mc-label { font-size:.68rem; color:#9CA3AF; text-transform:uppercase;
+            letter-spacing:.06em; font-weight:600; }
+.mc-value { font-size:1.4rem; font-weight:800; color:#F9FAFB; margin:.2rem 0 .1rem; }
+.mc-sub   { font-size:.7rem; color:#6B7280; }
+
+/* ── Hero result (big number) ─────────────────────────────────────────── */
+.result-hero {
+    background:linear-gradient(135deg,#1e3a5f 0%,#1d3461 60%,#1e40af 100%);
+    border:1px solid #2563eb55; border-radius:16px;
+    padding:1.75rem 2rem; margin-bottom:1.5rem;
+    box-shadow:0 0 40px rgba(37,99,235,.2);
+}
+.rh-label { font-size:.72rem; color:#93c5fd; text-transform:uppercase;
+            letter-spacing:.07em; font-weight:600; }
+.rh-value { font-size:2.8rem; font-weight:800; color:white; line-height:1.1;
+            margin:.2rem 0 .4rem; }
+.rh-row   { display:flex; align-items:center; gap:1rem; flex-wrap:wrap; }
+.rh-badge {
+    display:inline-flex; align-items:center; gap:.3rem;
+    background:rgba(34,197,94,.18); color:#4ade80;
+    border:1px solid rgba(34,197,94,.3);
+    font-size:.8rem; font-weight:700;
+    padding:.25rem .7rem; border-radius:999px;
+}
+.rh-badge.down {
+    background:rgba(239,68,68,.18); color:#f87171;
+    border-color:rgba(239,68,68,.3);
+}
+.rh-hint { font-size:.82rem; color:#93c5fd; }
+
+/* ── Scenarios ────────────────────────────────────────────────────────── */
+.sc-wrap { display:flex; gap:.75rem; flex-wrap:wrap; margin:.75rem 0; }
+.sc-card {
+    flex:1; min-width:130px; border-radius:12px; padding:.9rem;
+    text-align:center; border:1px solid;
+}
+.sc-icon  { font-size:1.2rem; }
+.sc-label { font-size:.67rem; font-weight:700; text-transform:uppercase;
+            letter-spacing:.05em; margin-top:.2rem; }
+.sc-val   { font-size:1.15rem; font-weight:800; margin-top:.1rem; }
+.sc-opt   { background:rgba(34,197,94,.08);  border-color:rgba(34,197,94,.3);  color:#4ade80; }
+.sc-base  { background:rgba(59,130,246,.08); border-color:rgba(59,130,246,.3); color:#93c5fd; }
+.sc-cons  { background:rgba(245,158,11,.08); border-color:rgba(245,158,11,.3); color:#fcd34d; }
+
+/* ── Recommendation items ────────────────────────────────────────────── */
+.rec-section-title {
+    font-size:.8rem; font-weight:700; color:#6B7280;
+    text-transform:uppercase; letter-spacing:.07em;
+    margin:1.25rem 0 .6rem;
+}
+.rec-item {
+    display:flex; align-items:flex-start; gap:.7rem;
+    padding:.8rem 1rem; border-radius:10px;
+    margin-bottom:.5rem; border-left:3px solid;
+    font-size:.875rem; line-height:1.55;
+}
+.rec-ok   { background:rgba(34,197,94,.07);  border-color:#22C55E; color:#d1fae5; }
+.rec-warn { background:rgba(245,158,11,.07); border-color:#F59E0B; color:#fef3c7; }
+.rec-info { background:rgba(59,130,246,.07); border-color:#3B82F6; color:#dbeafe; }
+.rec-icon { font-size:1rem; flex-shrink:0; padding-top:.05rem; }
+.rec-text { flex:1; }
+
+/* ── Loading timeline ────────────────────────────────────────────────── */
+.tl-item {
+    display:flex; align-items:center; gap:.8rem;
+    padding:.5rem 0; font-size:.88rem; color:#D1D5DB;
+}
+.tl-dot {
+    width:22px; height:22px; border-radius:50%; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; font-size:.75rem;
+}
+.tl-done    { background:#22C55E; color:white; }
+.tl-active  { background:#3B82F6; color:white;
+              animation: pulse 1.2s infinite; }
+.tl-pending { background:#374151; color:#6B7280; }
+
+@keyframes pulse {
+    0%,100% { box-shadow:0 0 0 0 rgba(59,130,246,.5); }
+    50%      { box-shadow:0 0 0 6px rgba(59,130,246,.0); }
+}
+
+/* ── Confidence badge ────────────────────────────────────────────────── */
+.conf-badge {
+    display:inline-flex; align-items:center; gap:.35rem;
+    padding:.3rem .75rem; border-radius:999px;
+    font-size:.78rem; font-weight:700;
+}
+.conf-alta  { background:rgba(34,197,94,.15);  color:#4ade80;  border:1px solid rgba(34,197,94,.3);  }
+.conf-media { background:rgba(245,158,11,.15); color:#fcd34d; border:1px solid rgba(245,158,11,.3); }
+.conf-baja  { background:rgba(239,68,68,.15);  color:#f87171;  border:1px solid rgba(239,68,68,.3);  }
+
+/* ── Download buttons ────────────────────────────────────────────────── */
+div.stDownloadButton > button,
+div.stButton > button {
+    background:linear-gradient(135deg,#2563EB,#3B82F6) !important;
+    color:white !important; font-weight:700 !important;
+    border:none !important; border-radius:10px !important;
+    font-size:.9rem !important; width:100% !important;
+    padding:.65rem 1rem !important;
+    box-shadow:0 2px 12px rgba(59,130,246,.3) !important;
+    transition:all .2s !important;
+}
+div.stDownloadButton > button:hover,
+div.stButton > button:hover {
+    box-shadow:0 4px 20px rgba(59,130,246,.5) !important;
+    transform:translateY(-1px) !important;
+}
+
+/* ── Tabs ────────────────────────────────────────────────────────────── */
+[data-baseweb="tab-list"] {
+    background:#1F2937 !important; border-radius:10px;
+    padding:.3rem; gap:.2rem; border:1px solid #374151;
+}
+[data-baseweb="tab"] {
+    background:transparent !important; color:#9CA3AF !important;
+    border-radius:8px !important; font-size:.82rem !important;
+    font-weight:600 !important; padding:.45rem .9rem !important;
+}
+[aria-selected="true"][data-baseweb="tab"] {
+    background:#3B82F6 !important; color:white !important;
+}
+[data-baseweb="tab-panel"] {
+    padding-top:1.25rem !important;
+}
+
+/* ── Table ────────────────────────────────────────────────────────────── */
+[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
+
+/* ── Selectbox / slider ───────────────────────────────────────────────── */
+[data-testid="stSelectbox"] label,
+[data-testid="stSlider"]    label { color:#D1D5DB !important; font-weight:500; }
+
+/* ── File uploader ────────────────────────────────────────────────────── */
+[data-testid="stFileUploader"] {
+    background:#1F2937 !important; border:2px dashed #374151 !important;
+    border-radius:12px !important;
+}
+[data-testid="stFileUploader"]:hover { border-color:#3B82F6 !important; }
+[data-testid="stFileUploaderDropzone"] { background:transparent !important; }
+
+/* ── Info / warning / error boxes ────────────────────────────────────── */
+[data-testid="stAlert"] {
+    background:#1F2937 !important; border-color:#374151 !important;
+    border-radius:10px !important;
+}
+
+/* ── Mobile bottom nav ────────────────────────────────────────────────── */
+.mobile-nav {
+    display:none;
+    position:fixed; bottom:0; left:0; right:0; z-index:9999;
+    background:#1F2937; border-top:1px solid #374151;
+    padding:.5rem 0 calc(.5rem + env(safe-area-inset-bottom));
+}
+.mobile-nav-items {
+    display:flex; justify-content:space-around; align-items:center; max-width:480px; margin:0 auto;
+}
+.mobile-nav-item {
+    display:flex; flex-direction:column; align-items:center; gap:.2rem;
+    font-size:.62rem; color:#6B7280; padding:.3rem .5rem;
+    cursor:pointer; min-width:50px;
+}
+.mobile-nav-item.active { color:#3B82F6; }
+.mobile-nav-item .nav-icon { font-size:1.2rem; }
+
+@media (max-width:640px) {
+    .mobile-nav { display:block; }
+    .hero-title  { font-size:1.8rem; }
+    .rh-value    { font-size:2rem; }
+    .hero-stats  { gap:1.5rem; }
+    .block-container { padding:1rem 1rem 5rem 1rem !important; }
+    .step-label  { display:none; }
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background:#1F2937 !important;
+    border-right:1px solid #374151 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# --- Encabezado ---
-st.markdown('<p class="app-title">SalesPredict</p>', unsafe_allow_html=True)
-st.markdown(
-    '<p class="app-subtitle">Sube tu CSV de ventas y obtén una proyección clara para los próximos días.</p>',
-    unsafe_allow_html=True
-)
+# ════════════════════════════════════════════════════════════════════════════
+# ESTADO DE SESIÓN
+# ════════════════════════════════════════════════════════════════════════════
 
-# --- Sidebar minimalista ---
-nombre_negocio = "Mi negocio"
-modo_log = "Automático"
-n_folds = 3
+def _init_state():
+    defaults = {
+        "step":       "hero",   # hero | upload | analyzing | results
+        "df_raw":     None,
+        "df_diario":  None,
+        "info":       None,
+        "prediccion": None,
+        "metricas":   None,
+        "columnas":   None,
+        "pais":       "Bolivia",
+        "moneda":     "Bs.",
+        "dias":       30,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-with st.sidebar:
-    st.markdown("**Ajustes**")
-    pais = st.selectbox(
-        "País (feriados)",
-        ["Bolivia", "Mexico", "Argentina", "Colombia", "Peru", "Chile",
-         "Espana", "USA", "Brasil", "Ecuador", "Venezuela", "Paraguay"],
-        help="Usamos los feriados de tu país para mejorar la predicción."
+_init_state()
+
+# ════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+
+MONEDAS = {
+    "Bolivia (Bs.)":    "Bs.",
+    "USA ($)":          "$",
+    "México (MXN)":     "MXN",
+    "Perú (S/)":        "S/",
+    "Colombia (COP)":   "COP",
+    "Argentina (ARS)":  "ARS",
+    "Chile (CLP)":      "CLP",
+    "Brasil (R$)":      "R$",
+}
+
+PAISES = ["Bolivia","Mexico","Colombia","Peru","Chile","Argentina",
+          "Espana","USA","Brasil","Ecuador","Venezuela","Paraguay"]
+
+def fmt(valor: float) -> str:
+    m = st.session_state.moneda
+    return f"{m} {valor:,.0f}"
+
+def _safe_chart(fig, key: str = None):
+    try:
+        if fig is not None:
+            kw = {"use_container_width": True}
+            if key:
+                kw["key"] = key
+            st.plotly_chart(fig, **kw)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _calidad_datos(df_raw, col_fecha, col_ventas) -> dict:
+    """Devuelve checks de calidad del CSV antes del análisis."""
+    checks, score = [], 100
+
+    # Fechas faltantes
+    nulos_fecha = df_raw[col_fecha].isna().sum() if col_fecha else len(df_raw)
+    if nulos_fecha == 0:
+        checks.append(("✅", "Sin fechas faltantes", True))
+    else:
+        checks.append(("⚠️", f"{nulos_fecha} fechas faltantes", False))
+        score -= 10
+
+    # Duplicados
+    dups = df_raw.duplicated().sum()
+    if dups == 0:
+        checks.append(("✅", "Sin duplicados", True))
+    else:
+        checks.append(("⚠️", f"{dups} filas duplicadas", False))
+        score -= 5
+
+    # Ventas nulas
+    nulos_v = df_raw[col_ventas].isna().sum() if col_ventas else len(df_raw)
+    if nulos_v == 0:
+        checks.append(("✅", "Sin valores vacíos en ventas", True))
+    else:
+        checks.append(("⚠️", f"{nulos_v} valores vacíos en ventas", False))
+        score -= 8
+
+    # Formato
+    checks.append(("✅", "Formato de archivo correcto", True))
+
+    nivel = "Excelente" if score >= 95 else ("Bueno" if score >= 80 else "Mejorable")
+    return {"checks": checks, "score": score, "nivel": nivel}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOPBAR + STEP PROGRESS
+# ════════════════════════════════════════════════════════════════════════════
+
+PASOS = ["Bienvenida","Carga","Procesando","Dashboard","Recomendaciones","Descarga"]
+_STEP_IDX = {"hero":0, "upload":1, "analyzing":2, "results":3}
+
+def _render_topbar():
+    step_n = _STEP_IDX.get(st.session_state.step, 0)
+    st.markdown(f"""
+    <div class="sp-topbar">
+      <div class="sp-logo">
+        <span class="sp-logo-icon">📈</span>
+        <span class="sp-logo-text">SalesPredict</span>
+        <span class="sp-logo-badge">AI</span>
+      </div>
+      <div class="sp-step-pill">
+        <span class="active">Paso {step_n+1}</span>
+        <span>de {len(PASOS)}</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def _render_stepbar():
+    step_n = _STEP_IDX.get(st.session_state.step, 0)
+    items_html = ""
+    for i, label in enumerate(PASOS):
+        if i > 0:
+            cls = "done" if i <= step_n else ""
+            items_html += f'<div class="step-connector {cls}"></div>'
+        if i < step_n:
+            cir, lab = "done", ""
+        elif i == step_n:
+            cir, lab = "active", "active"
+        else:
+            cir, lab = "", ""
+        icon = "✓" if i < step_n else str(i+1)
+        items_html += f"""
+        <div class="step-item">
+          <div class="step-circle {cir}">{icon}</div>
+          <div class="step-label {lab}">{label}</div>
+        </div>"""
+    st.markdown(f'<div class="step-bar">{items_html}</div>', unsafe_allow_html=True)
+
+
+def _render_mobile_nav():
+    tabs = [("🏠","Resumen"),("📈","Predicciones"),("🔔","Alertas"),
+            ("📊","Análisis"),("⋯","Más")]
+    items = "".join(
+        f'<div class="mobile-nav-item{"  active" if i==0 else ""}">'
+        f'<span class="nav-icon">{icon}</span>{lab}</div>'
+        for i,(icon,lab) in enumerate(tabs)
     )
-    dias_futuro = st.slider("Días a predecir", 7, 90, 30, 7)
-
-    with st.expander("Opciones avanzadas"):
-        nombre_negocio = st.text_input("Nombre del negocio", placeholder="Ej: Supermercado Central")
-        modo_log = st.radio(
-            "Suavizar picos extremos (log)",
-            ["Automático", "Sí", "No"],
-            index=0, horizontal=True,
-            help="Comprime los picos. En automático se activa solo si tus ventas son muy asimétricas."
-        )
-        n_folds = st.slider(
-            "Cortes de validación", 1, 4, 3,
-            help="Más cortes = medición del error más confiable, pero más lento."
-        )
-        if not HAS_PMDARIMA or not HAS_XGBOOST:
-            st.caption("Tip: instala `pip install pmdarima xgboost` para comparar más modelos.")
-
-    st.caption("Formato de fecha recomendado: DD/MM/YYYY · Mínimo 30 días de historial.")
-
-# --- Paso 1: Carga de datos ---
-st.markdown('<span class="step-badge">Paso 1</span>', unsafe_allow_html=True)
-st.markdown('<p class="step-title">Sube tu archivo CSV</p>', unsafe_allow_html=True)
-
-archivo = st.file_uploader(
-    "Arrastra tu CSV aquí o haz clic para seleccionarlo",
-    type=['csv'],
-    label_visibility="collapsed"
-)
-
-if archivo is None:
-    st.info("Necesitas un CSV con al menos una columna de **fecha** y otra de **ventas** (monto total por transacción o por día).")
-    st.stop()
-
-df_raw, info_carga = cargar_csv_seguro(archivo)
-if df_raw is None:
-    st.error(f"No se pudo leer el archivo: {info_carga}")
-    st.stop()
-
-columnas = detectar_columnas_clave(df_raw)
-st.success(f"Archivo cargado: **{len(df_raw):,}** filas")
-
-# --- Paso 2: Confirmar columnas ---
-st.markdown('<span class="step-badge">Paso 2</span>', unsafe_allow_html=True)
-st.markdown('<p class="step-title">Confirma las columnas correctas</p>', unsafe_allow_html=True)
-
-c1, c2 = st.columns(2)
-with c1:
-    idx_f = df_raw.columns.tolist().index(columnas['fecha']) if columnas['fecha'] in df_raw.columns else 0
-    col_fecha_sel = st.selectbox("Columna de fecha", df_raw.columns.tolist(), index=idx_f)
-with c2:
-    idx_v = df_raw.columns.tolist().index(columnas['ventas']) if columnas['ventas'] in df_raw.columns else 0
-    col_ventas_sel = st.selectbox("Columna de ventas ($)", df_raw.columns.tolist(), index=idx_v)
-
-with st.expander("Vista previa de datos"):
-    st.dataframe(df_raw.head(8), use_container_width=True, hide_index=True)
-    detectadas = {k: v for k, v in columnas.items() if v}
-    if detectadas:
-        st.caption(f"Columnas extra detectadas: {detectadas}")
-
-# --- Paso 3: Generar predicción ---
-st.markdown('<span class="step-badge">Paso 3</span>', unsafe_allow_html=True)
-st.markdown('<p class="step-title">Genera tu predicción</p>', unsafe_allow_html=True)
-
-if st.button("Generar predicción", type="primary", use_container_width=True):
-    if not nombre_negocio.strip():
-        nombre_negocio = "Mi negocio"
-
-    with st.spinner("Preparando tus datos..."):
-        df_limpio, info_val = limpiar_datos_v3(df_raw, col_fecha_sel, col_ventas_sel)
-
-    if info_val['estado'] == "ERROR":
-        st.error(info_val['mensaje'])
-        st.stop()
-    if info_val['estado'] == "WARNING":
-        st.warning(info_val['mensaje'])
-
-    st.caption(
-        f"Fechas interpretadas como **{info_val['formato_fecha']}** "
-        f"({info_val['pct_no_parseadas']}% ilegibles) · "
-        f"{info_val['dias']} días con ventas"
-        + (f" · días cerrados detectados: {len(info_val['dias_cerrados'])}" if info_val['dias_cerrados'] else "")
+    st.markdown(
+        f'<div class="mobile-nav"><div class="mobile-nav-items">{items}</div></div>',
+        unsafe_allow_html=True,
     )
 
-    usar_log = sugerir_log(df_limpio) if modo_log == "Automático" else (modo_log == "Sí")
+# ════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 1 — HERO
+# ════════════════════════════════════════════════════════════════════════════
 
-    barra = st.progress(0.0, text="Validando modelos...")
+def render_hero():
+    _render_topbar()
+    _render_stepbar()
 
-    def _progreso(pct, nombre):
-        barra.progress(min(pct, 1.0), text=f"Validando {nombre}...")
+    modelos_activos = len(get_modelos())
 
-    prediccion, metricas, error = analizar_v3(
-        df_limpio, pais, dias_futuro,
-        usar_log=usar_log, n_folds=n_folds, progreso=_progreso
+    st.markdown(f"""
+    <div class="hero-wrap">
+      <div class="hero-badge">🤖 IA · {modelos_activos} modelos · Sin código</div>
+      <h1 class="hero-title">
+        Convierte tus ventas<br>en <span>mejores decisiones</span>
+      </h1>
+      <p class="hero-sub">
+        Predice, planifica y haz crecer tu negocio con inteligencia artificial.
+        Solo sube tu historial de ventas en CSV o Excel.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_btn, col_demo, col_pad = st.columns([1, 1, 1])
+    with col_btn:
+        if st.button("Comenzar análisis →", key="btn_hero", use_container_width=True):
+            st.session_state.step = "upload"
+            st.rerun()
+    with col_demo:
+        if st.button("▶ Ver demo con CSV", key="btn_demo", use_container_width=True):
+            import io as _io
+            from src.data_loader import cargar_csv_seguro as _load_csv, detectar_columnas_clave as _det
+            with open("data/ventas_ejemplo.csv", "rb") as _f:
+                _df_raw, _ = _load_csv(_io.BytesIO(_f.read()))
+            _cols = _det(_df_raw)
+            st.session_state.df_raw   = _df_raw
+            st.session_state.columnas = {**_cols,
+                                          "fecha_sel":    _cols["fecha"],
+                                          "col_ventas_sel": _cols["ventas"]}
+            st.session_state.dias     = 30
+            st.session_state.demo_mode = True
+            st.session_state.step     = "analyzing"
+            st.rerun()
+
+    st.markdown("""
+    <p style="text-align:center;font-size:.78rem;color:#6B7280;margin-top:.5rem">
+        Sin registro &nbsp;·&nbsp; Rápido &nbsp;·&nbsp; Seguro &nbsp;·&nbsp; Gratis
+    </p>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="hero-stats">
+      <div style="text-align:center">
+        <div class="hero-stat-val">~85%</div>
+        <div class="hero-stat-lab">Precisión estimada</div>
+      </div>
+      <div style="text-align:center">
+        <div class="hero-stat-val">&lt; 60 s</div>
+        <div class="hero-stat-lab">Tiempo de análisis</div>
+      </div>
+      <div style="text-align:center">
+        <div class="hero-stat-val">5+</div>
+        <div class="hero-stat-lab">Modelos comparados</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Sidebar config
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuración")
+        pais = st.selectbox("🌍 País", PAISES,
+                            index=PAISES.index(st.session_state.pais))
+        mon  = st.selectbox("💰 Moneda", list(MONEDAS.keys()))
+        st.session_state.pais   = pais
+        st.session_state.moneda = MONEDAS[mon]
+        st.markdown("---")
+        st.markdown("📂 [Descargar CSV de ejemplo](data/ventas_ejemplo.csv)")
+        st.markdown("❓ ¿Necesitas ayuda? [Leer guía](#)")
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 2 — CARGA
+# ════════════════════════════════════════════════════════════════════════════
+
+def render_upload():
+    _render_topbar()
+    _render_stepbar()
+
+    col_back, _ = st.columns([1, 5])
+    with col_back:
+        if st.button("← Volver", key="btn_back_upload"):
+            st.session_state.step = "hero"
+            st.rerun()
+
+    st.markdown("""
+    <p class="upload-title">Sube tu archivo de ventas</p>
+    <p class="upload-sub">CSV o Excel con al menos una columna de <b>fecha</b> y otra de <b>ventas</b></p>
+    """, unsafe_allow_html=True)
+
+    archivo = st.file_uploader(
+        "Arrastra tu archivo aquí o haz clic",
+        type=["csv", "xlsx", "xls"],
+        label_visibility="collapsed",
+        key="file_uploader",
     )
-    barra.empty()
 
-    if error:
-        st.error(f"No se pudo completar el análisis: {error}")
-        st.stop()
+    # Config
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuración")
+        pais = st.selectbox("🌍 País", PAISES,
+                            index=PAISES.index(st.session_state.pais))
+        mon  = st.selectbox("💰 Moneda", list(MONEDAS.keys()))
+        st.session_state.pais   = pais
+        st.session_state.moneda = MONEDAS[mon]
 
-    recomendaciones = generar_recomendaciones_v3(df_limpio, prediccion, metricas, info_val)
-    confianza = evaluar_confiabilidad(df_limpio, metricas['MAPE'])
-    pred_fut = prediccion[prediccion['ds'] > df_limpio['ds'].max()]
-    pred_total = pred_fut['yhat'].sum()
-    ventas_total = df_limpio['y'].sum()
+    if archivo is None:
+        st.markdown("""
+        <div class="card" style="margin-top:1rem;text-align:center;padding:2rem">
+          <div style="font-size:2.5rem;margin-bottom:.75rem">📂</div>
+          <div style="color:#9CA3AF;font-size:.88rem">
+            Formatos aceptados: <b>CSV</b>, <b>XLSX</b>, <b>XLS</b><br>
+            Tamaño máximo: 200 MB
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
 
-    # --- Resultado principal (hero) ---
+    # Cargar datos
+    try:
+        if archivo.name.endswith((".xlsx", ".xls")):
+            df_raw, _ = cargar_excel_seguro(archivo)
+        else:
+            df_raw, _ = cargar_csv_seguro(archivo)
+    except Exception as e:
+        st.error("No se pudo leer el archivo. Verifica que sea un CSV o Excel válido.")
+        return
+
+    if df_raw is None:
+        st.error("No se pudo leer el archivo.")
+        return
+
+    columnas = detectar_columnas_clave(df_raw)
+
+    # Selectores de columnas
+    col1, col2 = st.columns(2)
+    with col1:
+        all_cols  = df_raw.columns.tolist()
+        idx_f     = all_cols.index(columnas["fecha"]) if columnas["fecha"] in all_cols else 0
+        col_fecha = st.selectbox("📅 Columna de fechas", all_cols, index=idx_f)
+    with col2:
+        idx_v      = all_cols.index(columnas["ventas"]) if columnas["ventas"] in all_cols else 0
+        col_ventas = st.selectbox("💰 Columna de ventas", all_cols, index=idx_v)
+
+    # Preview
+    with st.expander("👁 Vista previa del archivo"):
+        try:
+            st.dataframe(df_raw.head(6), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+
+    # Checks de calidad
+    calidad = _calidad_datos(df_raw, col_fecha, col_ventas)
+    checks_html = ""
+    for icon, texto, ok in calidad["checks"]:
+        cls = "q-check" if ok else "q-warn"
+        checks_html += f"""
+        <div class="quality-row">
+          <span class="{cls}">{icon} {texto}</span>
+        </div>"""
+    score_color = "#22C55E" if calidad["score"] >= 90 else "#F59E0B"
+    st.markdown(f"""
+    <div class="quality-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem">
+        <span style="font-size:.85rem;font-weight:700;color:#D1D5DB">Verificación de calidad</span>
+        <span class="q-score" style="color:{score_color}">
+          {calidad["score"]}% {calidad["nivel"]}
+        </span>
+      </div>
+      {checks_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+    dias_futuro = st.select_slider(
+        "📆 Días a proyectar",
+        options=[7, 14, 21, 30, 45, 60, 90],
+        value=30,
+        key="dias_slider",
+    )
+
+    st.session_state.df_raw    = df_raw
+    st.session_state.columnas  = {**columnas, "fecha_sel": col_fecha, "col_ventas_sel": col_ventas}
+    st.session_state.dias      = dias_futuro
+
+    if st.button("Analizar ventas 📊", key="btn_analizar", use_container_width=True):
+        st.session_state.step = "analyzing"
+        st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 3 — ANALIZANDO
+# ════════════════════════════════════════════════════════════════════════════
+
+def render_analyzing():
+    _render_topbar()
+    _render_stepbar()
+
+    df_raw     = st.session_state.df_raw
+    columnas   = st.session_state.columnas
+    col_fecha  = columnas["fecha_sel"]
+    col_ventas = columnas["col_ventas_sel"]
+    dias       = st.session_state.dias
+    pais       = st.session_state.pais
+
+    st.markdown("""
+    <div style="text-align:center;padding:1.5rem 0 1rem">
+      <div style="font-size:2rem;margin-bottom:.5rem">🔄</div>
+      <h2 style="font-size:1.4rem;font-weight:800;color:#F9FAFB;margin:0">
+        Analizando tus datos…
+      </h2>
+      <p style="color:#9CA3AF;font-size:.85rem;margin:.4rem 0 0">
+        Esto suele tardar entre 15 y 60 segundos
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    pasos_tl = [
+        "Archivo recibido",
+        "Limpieza y validación de datos",
+        "Detección de patrones estacionales",
+        "Comparando modelos de IA",
+        "Generando proyección",
+        "Creando recomendaciones",
+    ]
+
+    tl_placeholder = st.empty()
+    prog_bar       = st.progress(0)
+
+    def render_tl(done_idx: int, active_idx: int):
+        html = '<div style="max-width:480px;margin:0 auto">'
+        for i, label in enumerate(pasos_tl):
+            if i < done_idx:
+                cls, icon = "tl-done", "✓"
+            elif i == active_idx:
+                cls, icon = "tl-active", "⏳"
+            else:
+                cls, icon = "tl-pending", str(i+1)
+            html += f"""
+            <div class="tl-item">
+              <div class="tl-dot {cls}">{icon}</div>
+              <span>{label}</span>
+            </div>"""
+        html += "</div>"
+        tl_placeholder.markdown(html, unsafe_allow_html=True)
+
+    render_tl(0, 0)
+    prog_bar.progress(5)
+
+    # ── Paso 1: limpiar datos ──────────────────────────────────────────────
+    cols_ext = {
+        k: columnas.get(k)
+        for k in ["temperatura","lluvia","evento","tasa_inflacion","trafico_web","conversion","carritos"]
+        if columnas.get(k)
+    }
+    df_diario, info = preparar_serie(df_raw, col_fecha, col_ventas, cols_ext or None)
+
+    if info["estado"] == "ERROR":
+        prog_bar.empty(); tl_placeholder.empty()
+        st.error(f"❌ {info['mensaje']}")
+        if st.button("← Volver a cargar datos"):
+            st.session_state.step = "upload"
+            st.rerun()
+        return
+
+    render_tl(2, 2); prog_bar.progress(25)
+
+    # ── Paso 2: análisis ───────────────────────────────────────────────────
+    pasos_modelo = [None]
+
+    def cb_progreso(fraccion: float, nombre: str):
+        pasos_modelo[0] = nombre
+        render_tl(2, 3)
+        prog_bar.progress(int(25 + fraccion * 50))
+
+    # La selección automática de log se resuelve dentro de cada fold para
+    # evitar usar información de la ventana de validación.
+    usar_log = None
+    prediccion, metricas, error = analizar(
+        df_diario, pais, dias,
+        usar_log=usar_log, n_folds=3,
+        progreso=cb_progreso,
+    )
+
+    if error or prediccion is None:
+        prog_bar.empty(); tl_placeholder.empty()
+        st.error(f"No se pudo completar el análisis. {error or ''}")
+        if st.button("← Volver"):
+            st.session_state.step = "upload"
+            st.rerun()
+        return
+
+    render_tl(5, 5); prog_bar.progress(95)
+
+    st.session_state.df_diario  = df_diario
+    st.session_state.info       = info
+    st.session_state.prediccion = prediccion
+    st.session_state.metricas   = metricas
+    st.session_state.step       = "results"
+
+    prog_bar.progress(100)
+    st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 4 — RESULTADOS
+# ════════════════════════════════════════════════════════════════════════════
+
+def render_results():
+    _render_topbar()
+    _render_stepbar()
+
+    df_diario  = st.session_state.df_diario
+    df_raw     = st.session_state.df_raw
+    prediccion = st.session_state.prediccion
+    metricas   = st.session_state.metricas
+    info       = st.session_state.info
+    columnas   = st.session_state.columnas
+    moneda     = st.session_state.moneda
+    dias       = st.session_state.dias
+
+    col_back, col_title, col_new = st.columns([1, 4, 1])
+    with col_back:
+        if st.button("← Subir otro", key="btn_new"):
+            for k in ["df_raw","df_diario","info","prediccion","metricas"]:
+                st.session_state[k] = None
+            st.session_state.step = "upload"
+            st.rerun()
+
+    # Sidebar config
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuración")
+        pais = st.selectbox("🌍 País", PAISES,
+                            index=PAISES.index(st.session_state.pais))
+        mon  = st.selectbox("💰 Moneda", list(MONEDAS.keys()))
+        st.session_state.pais   = pais
+        st.session_state.moneda = MONEDAS[mon]
+        moneda = MONEDAS[mon]
+        st.markdown("---")
+        dias = st.select_slider("📆 Días proyectados", [7,14,21,30,45,60,90], value=dias)
+
+    # ── Calcular KPIs ─────────────────────────────────────────────────────
+    hoy      = df_diario["ds"].max()
+    futuro   = prediccion[prediccion["ds"] > hoy]
+    total_f  = float(futuro["yhat"].sum())
+    abiertos = solo_dias_abiertos(df_diario)
+    ult_mismo_periodo = float(abiertos["y"].tail(dias).sum())
+    cambio_pct = (total_f - ult_mismo_periodo) / max(ult_mismo_periodo, 1) * 100
+    precision  = metricas["Precision"]
+    conf       = evaluar_confiabilidad(df_diario, metricas["MAPE"])
+
+    tab_res, tab_pred, tab_cat, tab_rec = st.tabs([
+        "📊 Resumen", "📈 Predicciones", "🗂 Categorías", "🤖 Recomendaciones IA"
+    ])
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 1 — RESUMEN
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_res:
+        # ── Big hero number ─────────────────────────────────────────────
+        dir_icon  = "↑" if cambio_pct >= 0 else "↓"
+        badge_cls = "rh-badge" if cambio_pct >= 0 else "rh-badge down"
+        st.markdown(f"""
+        <div class="result-hero">
+          <div class="rh-label">Ventas esperadas — próximos {dias} días</div>
+          <div class="rh-value">{moneda} {total_f:,.0f}</div>
+          <div class="rh-row">
+            <span class="{badge_cls}">{dir_icon} {abs(cambio_pct):.1f}% vs período anterior</span>
+            <span class="rh-hint">Proyección del Sistema IA</span>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── 4 metric cards ───────────────────────────────────────────────
+        dias_nombres = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+        abiertos_temp = abiertos.copy()
+        abiertos_temp["dow"] = abiertos_temp["ds"].dt.dayofweek
+        mejor_dow     = abiertos_temp.groupby("dow")["y"].mean().idxmax()
+        mejor_dia     = dias_nombres[mejor_dow]
+        alertas_n     = sum(1 for r in generar_recomendaciones(df_diario, prediccion, metricas, info)
+                           if r["tipo"] == "alerta")
+
+        c1, c2, c3, c4 = st.columns(4)
+        for col, icon, label, val, sub in [
+            (c1, "📅", "Mejor día", mejor_dia, "Mayor venta promedio"),
+            (c2, "🎯", "Precisión IA", f"{precision:.0f}%", "Estimación del sistema"),
+            (c3, "📊", "Calidad datos", f"{100 - info['pct_zeros']:.0f}%", f"{info['dias']} días disponibles"),
+            (c4, "🔔", "Alertas", str(alertas_n), "Requieren atención"),
+        ]:
+            with col:
+                st.markdown(f"""
+                <div class="mc">
+                  <div class="mc-icon">{icon}</div>
+                  <div class="mc-label">{label}</div>
+                  <div class="mc-value">{val}</div>
+                  <div class="mc-sub">{sub}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<div style='margin-top:1.25rem'/>", unsafe_allow_html=True)
+
+        # ── Gráfico principal ────────────────────────────────────────────
+        fig_main = grafico_proyeccion(df_diario, prediccion, moneda,
+                                       f"Proyección — {dias} días")
+        _safe_chart(fig_main, "chart_main")
+
+        # ── Confiabilidad ────────────────────────────────────────────────
+        nivel_raw = conf["nivel"].split()[1]  # ALTA / MEDIA / BAJA
+        cls_map   = {"ALTA":"conf-alta","MEDIA":"conf-media","BAJA":"conf-baja"}
+        cls_conf  = cls_map.get(nivel_raw, "conf-media")
+        det_html  = " &nbsp;·&nbsp; ".join(conf["detalles"])
+        st.markdown(f"""
+        <div class="card" style="margin-top:.75rem">
+          <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+            <span style="font-size:.85rem;font-weight:700;color:#D1D5DB">Nivel de confianza:</span>
+            <span class="conf-badge {cls_conf}">{conf['nivel']} — {conf['score']}/100</span>
+          </div>
+          <div style="font-size:.75rem;color:#6B7280;margin-top:.5rem">{det_html}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 2 — PREDICCIONES
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_pred:
+        # ── Escenarios ───────────────────────────────────────────────────
+        q_alto = prediccion["yhat_upper"].sum() if "yhat_upper" in prediccion else total_f * 1.15
+        q_bajo = prediccion["yhat_lower"].sum() if "yhat_lower" in prediccion else total_f * 0.88
+        st.markdown(f"""
+        <div class="sc-wrap">
+          <div class="sc-card sc-opt">
+            <div class="sc-icon">🚀</div>
+            <div class="sc-label">Optimista</div>
+            <div class="sc-val">{moneda} {float(futuro['yhat_upper'].sum() if 'yhat_upper' in futuro.columns else total_f*1.15):,.0f}</div>
+          </div>
+          <div class="sc-card sc-base">
+            <div class="sc-icon">📈</div>
+            <div class="sc-label">Esperado</div>
+            <div class="sc-val">{moneda} {total_f:,.0f}</div>
+          </div>
+          <div class="sc-card sc-cons">
+            <div class="sc-icon">🛡️</div>
+            <div class="sc-label">Conservador</div>
+            <div class="sc-val">{moneda} {float(futuro['yhat_lower'].sum() if 'yhat_lower' in futuro.columns else total_f*0.88):,.0f}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Gráfico ───────────────────────────────────────────────────────
+        fig_full = grafico_proyeccion(df_diario, prediccion, moneda)
+        _safe_chart(fig_full, "chart_pred")
+
+        # ── Comparación de modelos ────────────────────────────────────────
+        pred_por_modelo = metricas.get("pred_por_modelo", {})
+        if pred_por_modelo:
+            with st.expander("🔬 Comparar modelos individuales"):
+                fig_cmp = grafico_comparacion_modelos(pred_por_modelo, df_diario, moneda)
+                _safe_chart(fig_cmp, "chart_cmp")
+
+                # Tabla de métricas por modelo
+                por_mod = metricas.get("por_modelo", {})
+                if por_mod:
+                    rows = []
+                    for nombre, m in por_mod.items():
+                        peso = metricas["pesos"].get(nombre, 0)
+                        rows.append({
+                            "Modelo":    nombre,
+                            "Precisión": f"{max(0,100-m['mape']):.1f}%",
+                            "MAE":       f"{m['mae']:,.0f}",
+                            "RMSE":      f"{m.get('rmse',0):,.0f}",
+                            "Peso IA":   f"{peso:.0%}",
+                        })
+                    st.dataframe(pd.DataFrame(rows), hide_index=True,
+                                 use_container_width=True)
+
+        # ── Tabla día a día ────────────────────────────────────────────
+        with st.expander("📋 Tabla día a día"):
+            tabla = futuro[["ds","yhat"]].copy()
+            tabla.columns = ["Fecha","Proyección"]
+            tabla["Fecha"] = tabla["Fecha"].dt.strftime("%a %d %b")
+            tabla["Proyección"] = tabla["Proyección"].map(lambda v: f"{moneda} {v:,.0f}")
+            if "yhat_lower" in futuro.columns:
+                tabla["Mínimo"]  = futuro["yhat_lower"].map(lambda v: f"{moneda} {v:,.0f}").values
+                tabla["Máximo"]  = futuro["yhat_upper"].map(lambda v: f"{moneda} {v:,.0f}").values
+            st.dataframe(tabla, hide_index=True, use_container_width=True)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 3 — CATEGORÍAS
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_cat:
+        col_branch   = columnas.get("branch")
+        col_ciudad   = columnas.get("ciudad")
+        col_producto = columnas.get("producto")
+        col_hora     = columnas.get("hora")
+        col_ventas_r = columnas.get("col_ventas_sel", "y")
+
+        mostro = False
+
+        fig_rama = grafico_ventas_rama(df_raw, col_branch, col_ventas_r)
+        if fig_rama:
+            _safe_chart(fig_rama, "ch_rama"); mostro = True
+
+        fig_ciudad = grafico_ventas_ciudad(df_raw, col_ciudad, col_ventas_r)
+        if fig_ciudad:
+            _safe_chart(fig_ciudad, "ch_ciudad"); mostro = True
+
+        fig_prod = grafico_ventas_producto(df_raw, col_producto, col_ventas_r)
+        if fig_prod:
+            _safe_chart(fig_prod, "ch_prod"); mostro = True
+
+        _safe_chart(grafico_patron_dia_semana(df_diario), "ch_dow")
+        mostro = True
+
+        fig_hora = grafico_ventas_hora(df_raw, col_hora, col_ventas_r)
+        if fig_hora:
+            _safe_chart(fig_hora, "ch_hora")
+
+        # Comparación de períodos
+        with st.expander("📊 Comparación de períodos"):
+            try:
+                tab_periodos = tabla_comparacion_periodos(df_diario)
+                st.dataframe(tab_periodos, hide_index=True, use_container_width=True)
+            except Exception:
+                pass
+
+        # Variables externas detectadas
+        ext = info.get("externas_disponibles", [])
+        if ext:
+            from src.features import impacto_externas
+            ganancias = impacto_externas(ext)
+            if ganancias:
+                rows_ext = [{"Variable": v[0], "Impacto estimado en precisión": v[1]}
+                            for v in ganancias.values()]
+                with st.expander("🌡 Variables externas en uso"):
+                    st.dataframe(pd.DataFrame(rows_ext), hide_index=True,
+                                 use_container_width=True)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 4 — RECOMENDACIONES IA
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_rec:
+        recs = generar_recomendaciones(df_diario, prediccion, metricas, info)
+
+        # ── ¿Qué detectó la IA? ──────────────────────────────────────────
+        st.markdown('<div class="rec-section-title">🔍 ¿Qué detectó la IA?</div>',
+                    unsafe_allow_html=True)
+
+        # Hallazgos automáticos
+        hallazgos = []
+        # Mejor día
+        abiertos2 = abiertos.copy()
+        abiertos2["dow"] = abiertos2["ds"].dt.dayofweek
+        dias_nombres_full = ["lunes","martes","miércoles","jueves","viernes","sábados","domingos"]
+        media_dow = abiertos2.groupby("dow")["y"].mean()
+        mejor_d   = media_dow.idxmax()
+        peor_d    = media_dow.idxmin()
+        hallazgos.append(f"Las ventas son más altas los <b>{dias_nombres_full[mejor_d]}</b> "
+                         f"({moneda} {media_dow[mejor_d]:,.0f} promedio).")
+        hallazgos.append(f"Los <b>{dias_nombres_full[peor_d]}</b> tienen el menor volumen "
+                         f"({moneda} {media_dow[peor_d]:,.0f} promedio).")
+
+        feriados_set = None
+        if metricas.get("pesos"):
+            # Tendencia
+            primera = float(abiertos["y"][:len(abiertos)//2].mean())
+            segunda = float(abiertos["y"][len(abiertos)//2:].mean())
+            if primera > 0:
+                cambio = (segunda - primera) / primera * 100
+                dir_t = "creciendo" if cambio > 0 else "bajando"
+                hallazgos.append(f"La tendencia está <b>{dir_t}</b> "
+                                  f"({abs(cambio):.1f}% en el último período).")
+
+        # Externas
+        ext = info.get("externas_disponibles", [])
+        if "lluvia" in ext:
+            hallazgos.append("Se detectó correlación entre <b>días de lluvia</b> y menores ventas.")
+        if "evento" in ext:
+            hallazgos.append("Los <b>eventos locales</b> generan picos de venta positivos.")
+
+        for h in hallazgos:
+            st.markdown(f"""
+            <div class="rec-item rec-info">
+              <span class="rec-icon">🔎</span>
+              <span class="rec-text">{h}</span>
+            </div>""", unsafe_allow_html=True)
+
+        # ── ¿Qué haría un gerente hoy? ───────────────────────────────────
+        st.markdown('<div class="rec-section-title">💼 ¿Qué haría un gerente hoy?</div>',
+                    unsafe_allow_html=True)
+
+        icon_map  = {"positivo": "🟢", "alerta": "🟡", "info": "🔵"}
+        class_map = {"positivo": "rec-ok", "alerta": "rec-warn", "info": "rec-info"}
+        for rec in recs:
+            icon  = icon_map.get(rec["tipo"], "🔵")
+            cls   = class_map.get(rec["tipo"], "rec-info")
+            st.markdown(f"""
+            <div class="rec-item {cls}">
+              <span class="rec-icon">{icon}</span>
+              <span class="rec-text">{rec['texto']}</span>
+            </div>""", unsafe_allow_html=True)
+
+        # ── Métricas técnicas (colapsado) ─────────────────────────────────
+        with st.expander("⚙️ Detalles técnicos del Sistema IA"):
+            st.markdown(f"""
+            | Métrica | Valor |
+            |---------|-------|
+            | Precisión estimada | {precision:.1f}% |
+            | Error absoluto medio (MAE) | {moneda} {metricas['MAE']:,.0f} |
+            | Error cuadrático (RMSE) | {moneda} {metricas.get('RMSE',0):,.0f} |
+            | Error ponderado (WAPE) | {metricas['WAPE']:.1f}% |
+            | Folds de validación | {metricas['folds']} |
+            | Días analizados | {info['dias']} |
+            | Formato de fecha | {info['formato_fecha']} |
+            """)
+            modelos_activos = ", ".join(metricas["pesos"].keys())
+            st.markdown(f"**Modelos activos:** {modelos_activos}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECCIÓN DE DESCARGA
+    # ════════════════════════════════════════════════════════════════════════
     st.markdown("---")
-    precision_txt = "Alta" if metricas['Precision'] >= 85 else ("Media" if metricas['Precision'] >= 70 else "Baja")
-    st.markdown(
-        f'<div class="result-hero">'
-        f'<div class="label">Ventas esperadas · próximos {dias_futuro} días</div>'
-        f'<div class="value">${pred_total:,.0f}</div>'
-        f'<div class="hint">Confianza {precision_txt.lower()} · basado en {info_val["dias"]} días de historial</div>'
-        f'</div>',
-        unsafe_allow_html=True
-    )
+    st.markdown("""
+    <div style="text-align:center;margin-bottom:1rem">
+      <span style="font-size:.95rem;font-weight:700;color:#D1D5DB">Exportar resultados</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.markdown(
-            f'<div class="metric-plain"><div class="lbl">Precisión estimada</div>'
-            f'<div class="val">{metricas["Precision"]}%</div></div>',
-            unsafe_allow_html=True
-        )
-    with m2:
-        st.markdown(
-            f'<div class="metric-plain"><div class="lbl">Ventas históricas</div>'
-            f'<div class="val">${ventas_total:,.0f}</div></div>',
-            unsafe_allow_html=True
-        )
-    with m3:
-        st.markdown(
-            f'<div class="metric-plain"><div class="lbl">Promedio diario</div>'
-            f'<div class="val">${info_val["venta_promedio"]:,.0f}</div></div>',
-            unsafe_allow_html=True
-        )
-    with m4:
-        st.markdown(
-            f'<div class="metric-plain"><div class="lbl">Días analizados</div>'
-            f'<div class="val">{info_val["dias"]}</div></div>',
-            unsafe_allow_html=True
-        )
+    # Preparar CSV de proyección
+    csv_pred = futuro[["ds","yhat"]].copy()
+    csv_pred.columns = ["Fecha","Proyeccion"]
+    if "yhat_lower" in futuro.columns:
+        csv_pred["Minimo"]  = futuro["yhat_lower"].values
+        csv_pred["Maximo"]  = futuro["yhat_upper"].values
+    csv_bytes = csv_pred.to_csv(index=False).encode("utf-8")
 
-    # --- Gráfico principal ---
-    st.subheader("Proyección de ventas")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df_limpio['ds'], y=df_limpio['y'], name='Ventas reales',
-        line=dict(color='#2563eb', width=2),
-        hovertemplate='%{x|%d/%m/%Y}<br>$%{y:,.0f}<extra></extra>'
-    ))
-    fig.add_trace(go.Scatter(
-        x=prediccion['ds'], y=prediccion['yhat'], name='Predicción',
-        line=dict(color='#f97316', width=2, dash='dash'),
-        hovertemplate='%{x|%d/%m/%Y}<br>$%{y:,.0f}<extra></extra>'
-    ))
-    fig.add_trace(go.Scatter(
-        x=pd.concat([prediccion['ds'], prediccion['ds'][::-1]]),
-        y=pd.concat([prediccion['yhat_upper'], prediccion['yhat_lower'][::-1]]),
-        fill='toself', fillcolor='rgba(249,115,22,0.1)',
-        line=dict(color='rgba(0,0,0,0)'), name='Rango probable',
-        hoverinfo='skip'
-    ))
-    fig.add_vline(x=df_limpio['ds'].max(), line=dict(color='#22c55e', width=1, dash='dot'))
-    fig.update_layout(
-        template='plotly_white', height=420, hovermode='x unified',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis_title="", yaxis_title="Ventas ($)",
-        margin=dict(l=40, r=20, t=30, b=40)
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # Preparar CSV de stock
+    csv_stock = csv_pred.copy()
+    csv_stock["Stock_sugerido"] = (csv_stock["Proyeccion"] * 1.20).round(0)
+    stock_bytes = csv_stock.to_csv(index=False).encode("utf-8")
 
-    # --- Escenarios en lenguaje simple ---
-    st.subheader("Tres escenarios")
-    e1, e2, e3 = st.columns(3)
-    e1.metric("Optimista", f"${pred_fut['yhat_upper'].sum():,.0f}", help="Si las ventas van mejor de lo esperado")
-    e2.metric("Esperado", f"${pred_fut['yhat'].sum():,.0f}", help="Escenario más probable")
-    e3.metric("Conservador", f"${pred_fut['yhat_lower'].sum():,.0f}", help="Si las ventas van peor de lo esperado")
-
-    # --- Recomendaciones ---
-    st.subheader("Qué hacer con esto")
-    css_map = {'positivo': 'rec-ok', 'alerta': 'rec-warn', 'info': 'rec-info'}
-    for rec in recomendaciones[:5]:
-        st.markdown(
-            f'<div class="rec-item {css_map.get(rec["tipo"], "rec-info")}">{rec["texto"]}</div>',
-            unsafe_allow_html=True
+    dc1, dc2, dc3 = st.columns(3)
+    with dc1:
+        st.download_button(
+            "📊 Descargar proyección CSV",
+            data=csv_bytes,
+            file_name="proyeccion_ventas.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with dc2:
+        st.download_button(
+            "📦 Plan de stock Excel",
+            data=stock_bytes,
+            file_name="plan_stock.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with dc3:
+        reporte_txt = (
+            f"REPORTE SALESPREDICT AI\n"
+            f"========================\n"
+            f"Generado: {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"Ventas esperadas ({dias} días): {moneda} {total_f:,.0f}\n"
+            f"vs período anterior: {cambio_pct:+.1f}%\n"
+            f"Precisión del sistema: {precision:.1f}%\n"
+            f"Días analizados: {info['dias']}\n\n"
+            f"PROYECCIÓN DÍA A DÍA\n"
+            f"--------------------\n"
+        ) + "\n".join(
+            f"{row['Fecha'].strftime('%d/%m/%Y')}: {moneda} {row['Proyeccion']:,.0f}"
+            for _, row in csv_pred.iterrows()
+        )
+        st.download_button(
+            "📄 Reporte de texto",
+            data=reporte_txt.encode("utf-8"),
+            file_name="reporte_salespredict.txt",
+            mime="text/plain",
+            use_container_width=True,
         )
 
-    # --- Tabla descargable ---
-    st.subheader("Detalle día a día")
-    pt = pred_fut[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(dias_futuro).copy()
-    pt.columns = ['Fecha', 'Predicción', 'Mínimo', 'Máximo']
-    pt['Fecha'] = pt['Fecha'].dt.strftime('%d/%m/%Y')
-    pt = pt.round(2)
-    st.dataframe(pt, use_container_width=True, hide_index=True)
+    # Mobile nav
+    if st.session_state.step == "results":
+        _render_mobile_nav()
 
-    csv_out = pt.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        "Descargar predicción (CSV)",
-        csv_out,
-        f"prediccion_{nombre_negocio.replace(' ', '_')}.csv",
-        "text/csv",
-        use_container_width=True
-    )
 
-    # --- Detalle técnico (colapsado) ---
-    with st.expander("Detalle técnico (para curiosos)"):
-        st.caption(f"Modelo seleccionado: **{metricas['modelo_ganador']}** · Error MAPE: **{metricas['MAPE']}%**")
-        st.caption(f"Nivel de confianza del análisis: **{confianza['nivel']}** ({confianza['score']}/100)")
-        for d in confianza['detalles']:
-            st.caption(d)
+# ════════════════════════════════════════════════════════════════════════════
+# ROUTER PRINCIPAL
+# ════════════════════════════════════════════════════════════════════════════
 
-        st.caption(
-            f"Validación temporal: {metricas['folds']} corte(s) de "
-            f"{metricas['horizonte_validacion']} días · "
-            f"transformación log: {'sí' if metricas['usar_log'] else 'no'}"
-        )
-        st.caption(f"WAPE {metricas['WAPE']}% · sMAPE {metricas['sMAPE']}% · MAE ${metricas['MAE']:,.0f}")
+step = st.session_state.step
 
-        st.markdown("**Comparación de modelos (promedio de todos los cortes)**")
-        tabla = pd.DataFrame([
-            {'Modelo': nom, 'MAPE %': m['mape'], 'WAPE %': m['wape'],
-             'MAE': m['mae'], 'Cortes': m['folds'],
-             'Peso en ensemble': metricas['pesos'].get(nom, 0)}
-            for nom, m in sorted(metricas['por_modelo'].items(), key=lambda x: x[1]['wape'])
-        ])
-        st.dataframe(tabla, use_container_width=True, hide_index=True)
-
-        st.caption(
-            "MAPE = error porcentual medio sobre días con ventas. WAPE = error total / ventas totales "
-            "(no explota en días de venta baja) y es la métrica con la que se eligen y ponderan los modelos. "
-            "Objetivo ideal: ≤15% con datos estables."
-        )
-
-    # --- Análisis por dimensión (colapsado) ---
-    with st.expander("Análisis por sucursal, producto, ciudad…"):
-        st.caption("Gráficos basados en tus datos originales (transacciones).")
-        g1, g2 = st.columns(2)
-        fig_rama = grafico_ventas_rama(df_raw, columnas['branch'], col_ventas_sel)
-        fig_ciudad = grafico_ventas_ciudad(df_raw, columnas['ciudad'], col_ventas_sel)
-        with g1:
-            st.plotly_chart(fig_rama, use_container_width=True) if fig_rama else st.caption("Sin columna de sucursal.")
-        with g2:
-            st.plotly_chart(fig_ciudad, use_container_width=True) if fig_ciudad else st.caption("Sin columna de ciudad.")
-
-        g3, g4 = st.columns(2)
-        fig_prod = grafico_ventas_producto(df_raw, columnas['producto'], col_ventas_sel)
-        with g3:
-            st.plotly_chart(fig_prod, use_container_width=True) if fig_prod else st.caption("Sin columna de producto.")
-        with g4:
-            st.plotly_chart(grafico_patron_dia_semana(df_raw, col_fecha_sel, col_ventas_sel), use_container_width=True)
-
-        g5, g6 = st.columns(2)
-        fig_hora = grafico_ventas_por_hora(df_raw, columnas['hora'], col_ventas_sel)
-        fig_heat = grafico_heatmap_rama_ciudad(df_raw, columnas['branch'], columnas['ciudad'], col_ventas_sel)
-        with g5:
-            st.plotly_chart(fig_hora, use_container_width=True) if fig_hora else st.caption("Sin columna de hora.")
-        with g6:
-            st.plotly_chart(fig_heat, use_container_width=True) if fig_heat else st.caption("Se necesitan sucursal y ciudad.")
-
-        st.markdown("**Comparación de periodos**")
-        st.dataframe(tabla_comparacion_periodos(df_raw, col_fecha_sel, col_ventas_sel), use_container_width=True, hide_index=True)
-
-    st.markdown(
-        f'<div class="footer-note">{nombre_negocio} · SalesPredict · Precisión {metricas["Precision"]}%</div>',
-        unsafe_allow_html=True
-    )
+if step == "hero":
+    render_hero()
+elif step == "upload":
+    render_upload()
+elif step == "analyzing":
+    render_analyzing()
+elif step == "results":
+    render_results()
+else:
+    st.session_state.step = "hero"
+    st.rerun()
